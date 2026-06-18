@@ -1,0 +1,6 @@
+[app.server]
+path = "server"
+
+[project]
+id = "7b7cb41e-62cb-49b5-b72f-0c035a3c6347"
+

@@ -1,0 +1,11 @@
+{
+  "name": "backend",
+  "private": true,
+  "workspaces": [
+    "server"
+  ],
+  "scripts": {},
+  "dependencies": {
+    "sharp": "^0.34.5"
+  }
+}
