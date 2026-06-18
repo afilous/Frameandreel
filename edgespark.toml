@@ -1,0 +1,8 @@
+[project]
+id = "f1720659-9ffc-42f0-b5bb-24dfb223721b"
+
+[app.server]
+path = "backend/server/src"
+
+[app.server.build]
+external = ["@generated", "drizzle-orm", "drizzle-orm/sqlite-core", "drizzle-orm/relations"]

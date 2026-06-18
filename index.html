@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <!-- Google Analytics 4 -->
+    <script>
+      // GA4 — measurement ID loaded from env or left blank until configured
+      window._GA_ID = typeof __GA_MEASUREMENT_ID__ !== 'undefined' ? __GA_MEASUREMENT_ID__ : null;
+    </script>
+    <script>
+      if (window._GA_ID) {
+        var s = document.createElement('script');
+        s.async = true;
+        s.src = 'https://www.googletagmanager.com/gtag/js?id=' + window._GA_ID;
+        document.head.appendChild(s);
+      }
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      if (window._GA_ID) { gtag('config', window._GA_ID); }
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Frame & Reel — Original Vintage Movie Posters</title>
+    <meta name="description" content="Frame & Reel — Authentic original movie posters from cinema's golden age. Pulp Fiction, The Godfather, James Bond, Clint Eastwood & more." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;0,800;0,900;1,400;1,500;1,600;1,700&family=Lora:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600&family=Special+Elite&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
