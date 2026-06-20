@@ -47,54 +47,10 @@ Return your findings in JSON format:
 // used). A working version of this endpoint, with confidence-tier grouping,
 // is now defined inside createApp() further down in this file.
 
-// POST /api/admin/media-library/batch-confirm-matches
-app.post("/api/admin/media-library/batch-confirm-matches", async (c) => {
-  const { matches } = await c.req.json();
-  if (!Array.isArray(matches)) return c.json({ error: "matches array required" }, 400);
-  const results = [];
-  for (const m of matches) {
-    await edgespark.db.all(sql.raw(`
-      UPDATE image_library SET
-        matched_inventory_id = ${m.inventory_id},
-        match_status = 'confirmed',
-        updated_at = ${Date.now()}
-      WHERE id = ${m.image_id}
-    `));
-    await syncMediaLibraryToInventory(edgespark, sql, m.image_id, m.inventory_id);
-    results.push({ image_id: m.image_id, inventory_id: m.inventory_id, success: true });
-  }
-  return c.json({ results, confirmed: results.length });
-});
-
-// POST /api/admin/media-library/reject-match
-app.post("/api/admin/media-library/reject-match", async (c) => {
-  const { image_id } = await c.req.json();
-  await edgespark.db.all(sql.raw(`
-    UPDATE image_library SET
-      match_status = 'rejected',
-      suggested_inventory_id = NULL,
-      match_confidence = NULL
-    WHERE id = ${image_id}
-  `));
-  return c.json({ success: true });
-});
-
-app.post("/api/ebay/batch-link", async (c) => {
-  const { matches } = await c.req.json();
-  if (!Array.isArray(matches)) return c.json({ error: "matches array required" }, 400);
-  const e = (s) => String(s||'').replace(/'/g,"''");
-  const results = [];
-  for (const m of matches) {
-    await edgespark.db.all(sql.raw(`
-      UPDATE inventory SET
-        ebay_item_id = '${e(m.ebay_item_id)}',
-        updated_at = ${Date.now()}
-      WHERE id = ${m.inventory_id}
-    `));
-    results.push({ ...m, success: true });
-  }
-  return c.json({ results, confirmed: results.length });
-});
+// NOTE: batch-confirm-matches, reject-match, and ebay/batch-link were
+// moved from here (this file's outer, unused `app` instance) into
+// createApp(), where `edgespark` is actually available as a parameter.
+// They are defined further down in this file, inside createApp().
 
 // ═══════════════════════════════════════════════════════════════
 // CONSOLIDATION ADDITIONS — Safe base64, retry, usage tracking,
@@ -6318,8 +6274,6 @@ CRITICAL RULES:
 - Italian posters: "Zincografica", "Fotolito", "Rotocalco", "Fotocromocombinazione" = printing method sub-contractors, NOT distributors
 - Double-feature poster: if "I GRANDI SUCCESSI" / "ACCOPPIATA" / "DOPPIO SPETTACOLO" present, set is_double_feature true`;
 
-  const ai = new GoogleGenAI({ apiKey: geminiKey });
-
   const responseSchema = {
     type: "OBJECT",
     properties: {
@@ -6731,6 +6685,59 @@ app.get("/api/admin/media-library/pending-matches", async (c) => {
     tiers: { high, medium, low },
     all: pending
   });
+});
+
+// POST /api/admin/media-library/batch-confirm-matches
+// (relocated here from module scope, where `edgespark` was undefined)
+app.post("/api/admin/media-library/batch-confirm-matches", async (c) => {
+  const { matches } = await c.req.json();
+  if (!Array.isArray(matches)) return c.json({ error: "matches array required" }, 400);
+  const results = [];
+  for (const m of matches) {
+    await edgespark.db.all(sql.raw(`
+      UPDATE image_library SET
+        matched_inventory_id = ${m.inventory_id},
+        match_status = 'confirmed',
+        updated_at = ${Date.now()}
+      WHERE id = ${m.image_id}
+    `));
+    await syncMediaLibraryToInventory(edgespark, sql, m.image_id, m.inventory_id);
+    results.push({ image_id: m.image_id, inventory_id: m.inventory_id, success: true });
+  }
+  return c.json({ results, confirmed: results.length });
+});
+
+// POST /api/admin/media-library/reject-match
+// (relocated here from module scope, where `edgespark` was undefined)
+app.post("/api/admin/media-library/reject-match", async (c) => {
+  const { image_id } = await c.req.json();
+  await edgespark.db.all(sql.raw(`
+    UPDATE image_library SET
+      match_status = 'rejected',
+      suggested_inventory_id = NULL,
+      match_confidence = NULL
+    WHERE id = ${image_id}
+  `));
+  return c.json({ success: true });
+});
+
+// POST /api/ebay/batch-link
+// (relocated here from module scope, where `edgespark` was undefined)
+app.post("/api/ebay/batch-link", async (c) => {
+  const { matches } = await c.req.json();
+  if (!Array.isArray(matches)) return c.json({ error: "matches array required" }, 400);
+  const e = (s: any) => String(s || "").replace(/'/g, "''");
+  const results = [];
+  for (const m of matches) {
+    await edgespark.db.all(sql.raw(`
+      UPDATE inventory SET
+        ebay_item_id = '${e(m.ebay_item_id)}',
+        updated_at = ${Date.now()}
+      WHERE id = ${m.inventory_id}
+    `));
+    results.push({ ...m, success: true });
+  }
+  return c.json({ results, confirmed: results.length });
 });
 
 
