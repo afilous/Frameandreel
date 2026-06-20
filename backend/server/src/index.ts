@@ -1,3 +1,12 @@
+// ═══════════════════════════════════════════════════════════════
+// CLAUDE-EDIT: 2026-06-20 | Backend consolidation — replaced Provenance
+// Engine Stage 1/2 endpoints with new /api/library/:id/identify,
+// /forensic, /ask endpoints; added processing_queue + api_usage_log
+// tables; added fuzzyMatchInventoryMulti; added country-specific
+// forensic rules + printer/distributor/pseudonym reference data.
+// Edited via Claude chat, manually uploaded to GitHub by Aaron.
+// Search this project for "CLAUDE-EDIT: 2026-06-20" for full context.
+// ═══════════════════════════════════════════════════════════════
 // v3
 import { Hono } from "hono";
 import type { Client } from "@sdk/server-types";
