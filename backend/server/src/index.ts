@@ -31,19 +31,12 @@ Return your findings in JSON format:
 - "identified_year": The year determined from the forensic evidence`;
 
 
-// GET /api/admin/media-library/pending-matches
-app.get("/api/admin/media-library/pending-matches", async (c) => {
-  const items = await edgespark.db.all(sql.raw(`
-    SELECT il.*, i.title as inv_title, i.year as inv_year,
-           i.format as inv_format, i.lot_id as inv_lot_id
-    FROM image_library il
-    LEFT JOIN inventory i ON il.suggested_inventory_id = i.id
-    WHERE il.match_status != 'confirmed'
-    AND il.suggested_inventory_id IS NOT NULL
-    ORDER BY il.match_confidence DESC
-  `));
-  return c.json({ items, total: items.length });
-});
+// NOTE: the original GET /api/admin/media-library/pending-matches endpoint
+// that was here has been removed — it was defined on this file's outer,
+// unused `app` instance (see line ~9 const app = new Hono()), which is
+// never the instance actually served (createApp's returned app is what's
+// used). A working version of this endpoint, with confidence-tier grouping,
+// is now defined inside createApp() further down in this file.
 
 // POST /api/admin/media-library/batch-confirm-matches
 app.post("/api/admin/media-library/batch-confirm-matches", async (c) => {
@@ -93,6 +86,189 @@ app.post("/api/ebay/batch-link", async (c) => {
   }
   return c.json({ results, confirmed: results.length });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// CONSOLIDATION ADDITIONS — Safe base64, retry, usage tracking,
+// country rules, reference data (Doc 1, file 01)
+// ═══════════════════════════════════════════════════════════════
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 8192;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const chunk = bytes.subarray(i, i + CHUNK);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+async function geminiWithRetry(
+  ai: any,
+  params: any,
+  maxRetries = 3,
+  delayMs = 2000
+): Promise<any> {
+  let lastError: any;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const result = await ai.models.generateContent(params);
+      return result;
+    } catch (err: any) {
+      lastError = err;
+      const is503 = err?.message?.includes("503") ||
+                    err?.message?.includes("UNAVAILABLE") ||
+                    err?.message?.includes("high demand");
+      if (!is503 || attempt === maxRetries - 1) throw err;
+      console.warn(`[Gemini] 503 attempt ${attempt + 1}/${maxRetries}, retrying in ${delayMs}ms`);
+      await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
+async function trackUsage(
+  edgespark: any,
+  sql: any,
+  model: string,
+  stage: string,
+  estimatedCostCents: number
+): Promise<void> {
+  const today = new Date().toISOString().split("T")[0];
+  try {
+    await edgespark.db.all(sql.raw(`
+      INSERT INTO api_usage_log (date, model, stage, calls, estimated_cost_cents, last_call_at)
+      VALUES ('${today}', '${model}', '${stage}', 1, ${estimatedCostCents}, ${Date.now()})
+      ON CONFLICT(date, model, stage) DO UPDATE SET
+        calls = calls + 1,
+        estimated_cost_cents = estimated_cost_cents + ${estimatedCostCents},
+        last_call_at = ${Date.now()}
+    `));
+  } catch (e) {
+    console.warn("[Usage] Failed to track usage:", e);
+  }
+}
+
+function buildCountryRules(country: string, yearStart: number, yearEnd: number): string {
+  const c = country.toLowerCase();
+  if (c.includes("ital")) return `
+ITALY RULES:
+- "Prima Edizione" / "Prima Edizione Italiana" = original first release marker
+- "Edizione Successiva" / "Riedizione" = explicit reissue marker
+- Visto di Censura ranges: 1945-49: 1-6000 | 1950-59: 6000-31000 | 1960-69: 31000-55000 | 1970-79: 55000-73000 | 1980-89: 73000+
+- Tax stamp (Imposta Pubblicità / Marca da Bollo): 1950s=L.20 | 1960s-70s=L.30-40 | 1980s=L.50-100+
+- Locandina format: IGNORE top 15-20% (blank "Spazio per il Cinema" — local theater stamps, not film data)
+- CIC logo = post-1970 | UIP logo = post-1981
+- "Fotocromocombinazione", "Fotolito", "Zincografica" = printing sub-contractors, NOT main printer
+- Expected era: ${yearStart}-${yearEnd}`;
+
+  if (c.includes("fran")) return `
+FRANCE RULES:
+- Visa d'exploitation ranges: 1945-49: 1-9000 | 1950-59: 9000-23000 | 1960-69: 23000-36000 | 1970-79: 36000-51000 | 1980-89: 51000+
+- Printer address format: pre-1972 = "Paris-9" or "Paris (10e)" | post-1972 = "75009" (5-digit)
+- If 5-digit postal code found and expected era ends before 1972 = reissue indicator
+- Reissues often have tiny date code near printer name e.g. "Saint-Martin - 75.12" = Dec 1975
+- IGNORE "1881" if preceded by "Loi du" or "Juillet" — legal boilerplate, NOT a year
+- French Visa stamp required on all originals — if printer present but no Visa number, flag for review
+- Expected era: ${yearStart}-${yearEnd}`;
+
+  if (c.includes("uk") || c.includes("brit")) return `
+UK RULES:
+- BBFC rating eras: pre-1970 = U/A/X(16+) | 1970-1982 = X(18+, spelled out) | post-1982 = 15/18/PG/12
+- If "15", "18", "PG" or "12" found and expected era ends before 1982 = definite reissue
+- Classic printers: W.E. Berry, Stafford & Co = 1940s-60s | Lonsdale & Bartholomew = 1960s-70s
+- Expected era: ${yearStart}-${yearEnd}`;
+
+  if (c.includes("austral")) return `
+AUSTRALIA RULES:
+- Pre-1971 classifications: "Suitable only for Adults" / "General Exhibition" (text)
+- Post-1971: boxed letter grades G/NRC/M/R — if found on pre-1971 film = reissue
+- Physical: pre-1970 Daybills = 15x40 with white border + 3 horizontal folds
+- Post-1975: shorter/wider ~13x30, often full-bleed, 2 folds
+- Expected era: ${yearStart}-${yearEnd}`;
+
+  if (c.includes("japan")) return `
+JAPAN RULES:
+- Eirin (映倫) number = sequential classification stamp. High 5-digit number on old film = reissue
+- Paper: originals (50s-60s) = flat matte fibrous | reissues = glossy/semi-gloss bright white
+- Distributors: Toho (kaiju/Kurosawa), Shochiku (Ozu/anime), Toei (yakuza/samurai), Nikkatsu (action)
+- Expected era: ${yearStart}-${yearEnd}`;
+
+  return `Expected era: ${yearStart}-${yearEnd}`;
+}
+
+function getKnownPrinters(country: string): string {
+  const c = country.toLowerCase();
+  if (c.includes("ital")) return KNOWN_ITALIAN_PRINTERS.join(", ");
+  if (c.includes("fran")) return KNOWN_FRENCH_PRINTERS.join(", ");
+  if (c.includes("uk") || c.includes("brit")) return KNOWN_UK_PRINTERS.join(", ");
+  if (c.includes("austral")) return KNOWN_AUSTRALIAN_PRINTERS.join(", ");
+  return [...KNOWN_ITALIAN_PRINTERS, ...KNOWN_FRENCH_PRINTERS].join(", ");
+}
+
+const STAGE1_MODEL = "gemini-2.5-flash-lite";
+const STAGE2_MODEL = "gemini-2.5-flash";
+const STAGE1_COST_CENTS = 0.1;
+const STAGE2_COST_CENTS = 0.2;
+
+const KNOWN_ITALIAN_PRINTERS = [
+  "Rotolitografica", "Rotopress", "Arti Grafiche Zoli", "Litoroma",
+  "S.A.C.", "Zincografica Firenze", "Pizzichemi", "I.G.E.R.",
+  "Grafiche S.A.T.", "Ditta A. Poli", "Zincografica", "Fotolito",
+  "Rotocalco", "Dromos", "Saccani"
+];
+
+const KNOWN_FRENCH_PRINTERS = [
+  "Cinémato", "Imprimerie Lalande", "Imprimerie Saint-Martin",
+  "Ets. Jouineau", "Affiche Gaillard", "Imprimerie Bedos",
+  "Imp. de Landais", "Affiches Michelson"
+];
+
+const KNOWN_UK_PRINTERS = [
+  "W.E. Berry", "Stafford & Co", "Lonsdale & Bartholomew",
+  "Donside", "S&D Toon", "W&G Baird"
+];
+
+const KNOWN_AUSTRALIAN_PRINTERS = [
+  "W.E. Smith", "Robert Burton", "M.A. Mapstone"
+];
+
+const KNOWN_DISTRIBUTORS = [
+  "Titanus", "Cineriz", "Cinecittà", "CIC", "Cinema International Corporation",
+  "United International Pictures", "UIP", "Lucky Red", "Dear Film",
+  "Dear International", "S.A.C.", "Gaumont", "Pathé", "Parafrance",
+  "Columbia-Warner", "Prodis", "Rank Organisation", "Hoyts", "Greater Union",
+  "Toho", "Shochiku", "Toei", "Nikkatsu",
+  "20th Century Fox", "MGM", "Columbia", "Warner Bros", "Paramount",
+  "Universal", "United Artists", "RKO", "Disney", "Embassy"
+];
+
+const DIRECTOR_PSEUDONYMS: Record<string, string> = {
+  "John Old": "Mario Bava",
+  "John M. Old": "Mario Bava",
+  "Mickey Lion": "Mario Bava",
+  "Louis Fuller": "Lucio Fulci",
+  "Hank Milestone": "Umberto Lenzi",
+  "Humphrey Humbert": "Umberto Lenzi",
+  "Simon Sterling": "Sergio Sollima",
+  "George B. Lewis": "Aldo Lado",
+  "Martin Dolman": "Sergio Martino",
+  "George Kaplan": "Sergio Martino",
+  "Robert Hampton": "Riccardo Freda",
+};
+
+const ACTOR_TRUE_NAMES: Record<string, string> = {
+  "Mario Girotti": "Terence Hill",
+  "Carlo Pedersoli": "Bud Spencer",
+  "John Wells": "Gian Maria Volonté",
+  "John Welch": "Gian Maria Volonté",
+  "John Garko": "Gianni Garko",
+  "A. Steffen": "Anthony Steffen",
+  "Montgomery Wood": "Giuliano Gemma",
+  "Alan Collins": "Luciano Pigozzi",
+  "Sara Bay": "Rosalba Neri",
+  "Gianni Belmondo": "Jean-Paul Belmondo",
+  "Alan Delon": "Alain Delon",
+};
 
 export async function createApp(
   edgespark: Client<typeof tables>
@@ -202,6 +378,48 @@ export async function createApp(
     console.log("[DB] ebay_listings table ready");
   } catch (e) {
     console.warn("[DB] ebay_listings table creation skipped:", e);
+  }
+
+  // ═══════════════════════════════════════════════════
+  // CONSOLIDATION ADDITIONS — processing queue + usage tracking
+  // ═══════════════════════════════════════════════════
+  try {
+    await edgespark.db.all(sql.raw(`
+      CREATE TABLE IF NOT EXISTS processing_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        image_id INTEGER NOT NULL,
+        stage TEXT NOT NULL DEFAULT 'stage1',
+        status TEXT NOT NULL DEFAULT 'pending',
+        priority INTEGER DEFAULT 0,
+        batch_context TEXT,
+        error TEXT,
+        queued_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        created_at INTEGER NOT NULL DEFAULT (cast(unixepoch('subsecond') * 1000 as integer))
+      )
+    `));
+    await edgespark.db.all(sql.raw(`
+      CREATE INDEX IF NOT EXISTS queue_status_idx ON processing_queue(status, stage)
+    `));
+    await edgespark.db.all(sql.raw(`
+      CREATE INDEX IF NOT EXISTS queue_image_idx ON processing_queue(image_id)
+    `));
+    await edgespark.db.all(sql.raw(`
+      CREATE TABLE IF NOT EXISTS api_usage_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        model TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        calls INTEGER DEFAULT 0,
+        estimated_cost_cents REAL DEFAULT 0,
+        last_call_at INTEGER,
+        UNIQUE(date, model, stage)
+      )
+    `));
+    console.log("[DB] processing_queue and api_usage_log tables ready");
+  } catch (e) {
+    console.warn("[DB] queue/usage table creation skipped:", e);
   }
 
   // ═══════════════════════════════════════════════════
@@ -3035,6 +3253,58 @@ app.get("/api/admin/media-library/suggest-match", async (c) => {
     return scored;
   };
 
+  // Enhanced multi-title inventory matching — checks ALL title variants at once
+  const fuzzyMatchInventoryMulti = async (
+    titles: string[],
+    year?: number,
+    lotNumber?: string | null,
+    limit = 5
+  ) => {
+    const clean = (s: string) => s.toLowerCase()
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+
+    const cleanTitles = [...new Set(titles.map(clean).filter(t => t.length >= 2))];
+    if (cleanTitles.length === 0) return [];
+
+    const titleConditions = cleanTitles.map(t =>
+      `LOWER(REPLACE(REPLACE(REPLACE(title, '-', ''), ':', ''), '''', '')) LIKE '%${t.replace(/'/g, "''")}%'
+       OR LOWER(COALESCE(original_title, '')) LIKE '%${t.replace(/'/g, "''")}%'`
+    ).join(" OR ");
+
+    let query = `SELECT id, title, original_title, year, format, actors, director, genre, lot_id
+      FROM inventory WHERE (${titleConditions})`;
+
+    if (lotNumber) query += ` AND lot_id = '${lotNumber.replace(/'/g, "''")}'`;
+    if (year) query += ` AND (year = ${year} OR year IS NULL)`;
+    query += ` LIMIT ${limit * 2}`;
+
+    const results = await edgespark.db.all<any>(sql.raw(query));
+
+    const seen = new Set<number>();
+    const scored = results
+      .filter((r: any) => { if (seen.has(r.id)) return false; seen.add(r.id); return true; })
+      .map((r: any) => {
+        const rt = clean(r.title);
+        const rot = clean(r.original_title || "");
+        let bestScore = 0;
+        for (const ct of cleanTitles) {
+          let score = 0;
+          if (rt === ct || rot === ct) score = 100;
+          else if (rt.includes(ct) || ct.includes(rt)) score = 80;
+          else if (rot && (rot.includes(ct) || ct.includes(rot))) score = 85;
+          if (year && r.year === year) score += 10;
+          bestScore = Math.max(bestScore, score);
+        }
+        return { ...r, score: bestScore };
+      })
+      .filter((r: any) => r.score > 0)
+      .sort((a: any, b: any) => b.score - a.score)
+      .slice(0, limit);
+
+    return scored;
+  };
+
   // Auto-ID via TMDB (no OCR server-side — client extracts text via Tesseract.js browser-side)
   app.post("/api/public/library/:id/auto-id", async (c) => {
     const id = parseInt(c.req.param("id"));
@@ -5690,346 +5960,770 @@ Only return the JSON, no other text.`;
     }
   });
 
+  // ═══════════════════════════════════════════════════════════
+  // CONSOLIDATED IDENTIFICATION PIPELINE (replaces Provenance Engine
+  // Stage 1/Stage 2 endpoints that were removed from this file)
+  // ═══════════════════════════════════════════════════════════
 
-  // ═══════════════════════════════════════════════════
-  // PROVENANCE ENGINE v2.0 - STAGE 1: IDENTIFY & LINK
-  // ═══════════════════════════════════════════════════
-  // Low-res scan (512px) for Identity + TMDB Link (Bilingual Titles)
-  // Cost: 1 unit
-  
-  app.post("/api/library/:id/identify", async (c) => {
-    const id = parseInt(c.req.param("id"));
-    const { 
-      director, 
-      actor, 
-      posterFormat,
-      posterCountry,
-      yearRangeStart, 
-      yearRangeEnd,
-      mediaResolution = "low"
-    } = await c.req.json() as any;
-    
-    console.log("[API] POST /api/library/:id/identify", { id, director, actor, posterFormat });
-    
-    const geminiKey = edgespark.secret.get("GEMINI_API_KEY");
-    if (!geminiKey) {
-      return c.json({ error: "Gemini API key not configured" }, 500);
-    }
-    
-    // Get image from library
-    const imgs = await edgespark.db.all<any>(sql.raw(`SELECT * FROM image_library WHERE id = ${id}`));
-    if (!imgs[0]) return c.json({ error: "Image not found" }, 404);
-    
-    const img = imgs[0];
-    
-    // Get the image file - use storage API correctly
+
+// ═══════════════════════════════════════════════════════════════
+// CONSOLIDATED STAGE 1: IDENTIFICATION
+// Replaces: /api/public/library/:id/auto-id AND /api/public/library/:id/ai-identify
+// ═══════════════════════════════════════════════════════════════
+app.post("/api/library/:id/identify", async (c) => {
+  const id = parseInt(c.req.param("id"));
+  const body = await c.req.json() as {
+    // Batch context — pass these when you know them
+    country?: string;        // e.g. "Italy", "France", "UK"
+    format?: string;         // e.g. "Italian Locandina", "French Grande"
+    yearStart?: number;      // e.g. 1965
+    yearEnd?: number;        // e.g. 1972
+    // Manual override — corrections to re-run with
+    knownDirector?: string;
+    knownActors?: string;
+    knownTitle?: string;
+    knownYear?: number;
+  };
+
+  console.log("[Stage1] POST /api/library/:id/identify", { id, body });
+
+  const geminiKey = edgespark.secret.get("GEMINI_API_KEY");
+  if (!geminiKey) return c.json({ error: "GEMINI_API_KEY not configured" }, 500);
+
+  // Get image record
+  const imgs = await edgespark.db.all<any>(sql.raw(
+    `SELECT * FROM image_library WHERE id = ${id}`
+  ));
+  if (!imgs[0]) return c.json({ error: "Image not found" }, 404);
+  const img = imgs[0];
+
+  // Get image file
+  let file: any;
+  try {
     const { bucket, path: storagePath } = edgespark.storage.fromS3Uri(img.s3_uri);
-    const file = await edgespark.storage.from(bucket).get(storagePath);
+    file = await edgespark.storage.from(bucket).get(storagePath);
     if (!file) return c.json({ error: "Image file not found in storage" }, 404);
-    
-    // Convert to base64 (resize to 512px max)
+  } catch (err: any) {
+    console.error("[Stage1] Storage fetch failed:", err.message);
+    return c.json({ error: "Failed to fetch image from storage: " + err.message }, 500);
+  }
+
+  // Convert to base64 safely
+  let base64: string;
+  try {
     const bytes = new Uint8Array(file.body);
-    let binary = "";
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    const base64 = btoa(binary);
-    
-    // Build search anchor from manual inputs
-    let searchAnchor = "";
-    if (director) searchAnchor += `Director: ${director}. `;
-    if (actor) searchAnchor += `Actor: ${actor}. `;
-    if (posterCountry) searchAnchor += `Poster country: ${posterCountry}. `;
-    if (yearRangeStart && yearRangeEnd) searchAnchor += `Expected era: ${yearRangeStart}-${yearRangeEnd}. `;
-    if (posterFormat) searchAnchor += `Poster format: ${posterFormat}. `;
-    
-    const prompt = `You are a movie poster identification expert. Analyze this poster image.
-    
-${searchAnchor}
-    
-Identify the movie and return a JSON object with:
-{
-  "movie_title": "English title",
-  "title_local": "Local language title (if different)",
-  "release_year": 4-digit year,
-  "director": "Director name",
-  "actors": "Main cast (comma separated)",
-  "genre": "Primary genre",
-  "tmdb_id": "TMDB ID if found",
-  "confidence": 0-100,
-  "billing_block": "Any billing block text found",
-  "studio": "Studio/distributor if visible",
-  "language": "Poster language (English, Italian, French, etc.)"
-}
+    base64 = bytesToBase64(bytes);
+  } catch (err: any) {
+    console.error("[Stage1] Base64 conversion failed:", err.message);
+    return c.json({ error: "Failed to process image data: " + err.message }, 500);
+  }
 
-If you cannot identify with >70% confidence, set confidence to lower and explain why in a "notes" field.`;
+  const mimeType = file.metadata?.contentType || "image/jpeg";
+  const ai = new GoogleGenAI({ apiKey: geminiKey });
 
+  // Build context string from known facts
+  const knownFacts = [
+    body.country && `Country: ${body.country}`,
+    body.format && `Format: ${body.format}`,
+    body.yearStart && body.yearEnd && `Expected era: ${body.yearStart}-${body.yearEnd}`,
+    body.knownDirector && `Known director: ${body.knownDirector}`,
+    body.knownActors && `Known actors: ${body.knownActors}`,
+    body.knownTitle && `Known title: ${body.knownTitle}`,
+    body.knownYear && `Known year: ${body.knownYear}`,
+  ].filter(Boolean).join("\n");
+
+  const prompt = `You are an expert vintage movie poster cataloger. Identify this poster.
+
+${knownFacts ? `KNOWN FACTS (treat as ground truth, do not contradict):\n${knownFacts}\n` : ""}
+
+BILLING BLOCK PARSING RULES:
+- Director is preceded by: "REGIA DI", "UN FILM DI", "RÉALISATION", "UN FILM DE", "DIRECTED BY"
+- Cast list follows: "CON" (Italian), "AVEC" (French), "WITH" (English)
+- Final/guest star follows: "E CON" or "CON LA PARTECIPAZIONE DI"
+- Strip character names from actor names — keep only the person's name
+- Italian accent: strip accents for matching (é→e, à→a, etc)
+- If billing_name differs from canonical English name (pseudonym), note both
+
+PSEUDONYM REFERENCE (resolve if you see these):
+${Object.entries(DIRECTOR_PSEUDONYMS).map(([k, v]) => `${k} = ${v}`).join(", ")}
+
+DOUBLE-FEATURE DETECTION:
+If you see "I GRANDI SUCCESSI", "ACCOPPIATA", or "DOPPIO SPETTACOLO", set
+is_double_feature to true and provide TWO entries in titles array.
+
+Return ONLY valid JSON matching this exact schema. Empty string for unknown fields.`;
+
+  const responseSchema = {
+    type: "OBJECT",
+    properties: {
+      movie_title: { type: "STRING", description: "Primary English title" },
+      title_local: { type: "STRING", description: "Local language title if different from English" },
+      title_billing: { type: "STRING", description: "Exact title as printed on this poster" },
+      release_year: { type: "STRING", description: "4-digit year or empty string" },
+      director_billing: { type: "STRING", description: "Director name exactly as printed" },
+      director_canonical: { type: "STRING", description: "Director's true/canonical name" },
+      lead_cast: {
+        type: "ARRAY",
+        items: { type: "STRING" },
+        description: "Actor names as printed"
+      },
+      detected_language: { type: "STRING", description: "Language of poster text" },
+      origin_country: { type: "STRING", description: "Country of film origin" },
+      genre: { type: "STRING" },
+      confidence: { type: "NUMBER", description: "0.0 to 1.0" },
+      is_double_feature: { type: "BOOLEAN" },
+      notes: { type: "STRING", description: "Anything unusual or uncertain" }
+    },
+    required: [
+      "movie_title", "title_local", "title_billing", "release_year",
+      "director_billing", "director_canonical", "lead_cast",
+      "detected_language", "origin_country", "genre", "confidence",
+      "is_double_feature"
+    ]
+  };
+
+  try {
+    const result = await geminiWithRetry(ai, {
+      model: STAGE1_MODEL,
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema,
+      },
+      contents: [{
+        role: "user",
+        parts: [{ text: prompt }, { inlineData: { data: base64, mimeType } }]
+      }]
+    });
+
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    let movieData: any;
     try {
-      const ai = new GoogleGenAI({ apiKey: geminiKey });
-      
-      const result = await ai.models.generateContent({
-        model: "gemini-2.5-flash-lite",
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { text: prompt },
-              { inlineData: { data: base64, mimeType: "image/jpeg" } }
-            ]
+      movieData = JSON.parse(text);
+    } catch {
+      return c.json({ error: "Failed to parse Gemini response", raw: text }, 422);
+    }
+
+    // Resolve pseudonyms
+    if (movieData.director_billing && DIRECTOR_PSEUDONYMS[movieData.director_billing]) {
+      movieData.director_canonical = DIRECTOR_PSEUDONYMS[movieData.director_billing];
+    }
+
+    // Try TMDB match using canonical director + cast + year (multi-key matrix)
+    const tmdbKey = edgespark.secret.get("TMDB_API_KEY") as string;
+    let inventoryMatches: any[] = [];
+    let tmdbData: any = null;
+
+    if (tmdbKey) {
+      // Build search query: prefer canonical title, fall back to director+actor matrix
+      const searchTitle = movieData.movie_title || movieData.title_billing;
+      if (searchTitle) {
+        try {
+          const yearParam = movieData.release_year ?
+            `&year=${movieData.release_year.substring(0, 4)}` : "";
+          const tmdbRes = await fetch(
+            `https://api.themoviedb.org/3/search/movie?query=${encodeURIComponent(searchTitle)}&include_adult=false${yearParam}&api_key=${tmdbKey}`
+          );
+          const tmdbResult = await tmdbRes.json() as any;
+
+          if (tmdbResult.results?.length > 0) {
+            const movie = tmdbResult.results[0];
+            // Fetch alternative titles for better matching
+            const [detailRes, altTitlesRes] = await Promise.all([
+              fetch(`https://api.themoviedb.org/3/movie/${movie.id}?append_to_response=credits&api_key=${tmdbKey}`),
+              fetch(`https://api.themoviedb.org/3/movie/${movie.id}/alternative_titles?api_key=${tmdbKey}`)
+            ]);
+            const details = await detailRes.json() as any;
+            const altTitles = await altTitlesRes.json() as any;
+
+            tmdbData = {
+              tmdbId: movie.id,
+              title: movie.title,
+              originalTitle: movie.original_title,
+              year: movie.release_date?.substring(0, 4),
+              director: details.credits?.crew?.find((c: any) => c.job === "Director")?.name,
+              actors: details.credits?.cast?.slice(0, 5).map((c: any) => c.name).join(", "),
+              genre: details.genres?.map((g: any) => g.name).join(", "),
+              alternativeTitles: altTitles.titles?.map((t: any) => t.title) || []
+            };
+
+            // Search inventory using ALL known title variants simultaneously
+            const allTitles = [
+              movieData.movie_title,
+              movieData.title_local,
+              movieData.title_billing,
+              tmdbData.title,
+              tmdbData.originalTitle,
+              ...tmdbData.alternativeTitles
+            ].filter(Boolean);
+
+            inventoryMatches = await fuzzyMatchInventoryMulti(
+              allTitles,
+              parseInt(movieData.release_year || tmdbData.year || "0"),
+              img.lot_number
+            );
           }
-        ]
-      });
-      
-      const text = result.text || "";
-      console.log("[API] Gemini identify response:", text.substring(0, 500));
-      
-      // Extract JSON from response
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        return c.json({ error: "Could not parse movie info from image", raw: text }, 422);
-      }
-      
-      const movieData = JSON.parse(jsonMatch[0]);
-      
-      // Check for year conflict
-      let yearWarning = null;
-      if (movieData.release_year && yearRangeEnd) {
-        if (movieData.release_year > parseInt(yearRangeEnd)) {
-          yearWarning = `Detected year ${movieData.release_year} is after expected era end ${yearRangeEnd}`;
+        } catch (err: any) {
+          console.warn("[Stage1] TMDB lookup failed:", err.message);
         }
       }
-      
-      // Update library record with DNA fields
+    }
+
+    // Write suggested match if high confidence
+    if (inventoryMatches.length > 0 && inventoryMatches[0].score >= 80) {
       await edgespark.db.all(sql.raw(`
-        UPDATE image_library SET 
-          title_original = '${(movieData.movie_title || "").replace(/'/g, "''")}',
-          title_local = '${(movieData.title_local || "").replace(/'/g, "''")}',
-          original_release_year = ${movieData.release_year || "NULL"},
-          identified_director = '${(movieData.director || "").replace(/'/g, "''")}',
-          identified_genre = '${(movieData.genre || "").replace(/'/g, "''")}',
-          identified_actors = '${(movieData.actors || "").replace(/'/g, "''")}',
-          distributor_logo = '${(movieData.studio || "").replace(/'/g, "''")}',
-          poster_country = '${(posterCountry || "").replace(/'/g, "''")}',
-          dna_audit_status = 'identified',
+        UPDATE image_library SET
+          suggested_inventory_id = ${inventoryMatches[0].id},
+          match_confidence = ${inventoryMatches[0].score / 100},
+          match_status = 'suggested',
           updated_at = ${Date.now()}
         WHERE id = ${id}
       `));
-      
-      return c.json({
-        success: true,
-        stage: "identify",
-        movieData,
-        yearWarning,
-        quotaUsed: 1
-      });
-      
-    } catch (error: any) {
-      console.error("[API] Identify error:", error.message);
-      return c.json({ error: "Identify failed: " + error.message }, 500);
     }
-  });
 
-  // ═══════════════════════════════════════════════════
-  // PROVENANCE ENGINE v2.0 - STAGE 2: ERA VALIDATOR
-  // ═══════════════════════════════════════════════════
-  // High-res forensic crops + Hard-coded Heuristics
-  // Cost: 3 units
-  
-  app.post("/api/library/:id/validate", async (c) => {
-    const id = parseInt(c.req.param("id"));
-    const { 
-      posterFormat,
-      posterCountry,
-      releaseType = "Original",
-      yearRangeStart, 
-      yearRangeEnd 
-    } = await c.req.json() as any;
-    
-    console.log("[API] POST /api/library/:id/validate", { id, posterFormat, posterCountry, releaseType });
-    
-    const geminiKey = edgespark.secret.get("GEMINI_API_KEY");
-    if (!geminiKey) {
-      return c.json({ error: "Gemini API key not configured" }, 500);
-    }
-    
-    // Get image from library
-    const imgs = await edgespark.db.all<any>(sql.raw(`SELECT * FROM image_library WHERE id = ${id}`));
-    if (!imgs[0]) return c.json({ error: "Image not found" }, 404);
-    
-    const img = imgs[0];
-    
-    // Get the image file - use storage API correctly
+    // Save identification results
+    const director = movieData.director_canonical || movieData.director_billing || "";
+    const e = (s: any) => String(s || "").replace(/'/g, "''");
+    await edgespark.db.all(sql.raw(`
+      UPDATE image_library SET
+        identified_title = '${e(movieData.movie_title || movieData.title_billing)}',
+        title_local = '${e(movieData.title_local)}',
+        identified_year = ${parseInt(movieData.release_year || "0") || "NULL"},
+        identified_director = '${e(director)}',
+        identified_genre = '${e(movieData.genre)}',
+        identified_actors = '${e(movieData.lead_cast?.join(", "))}',
+        identified_data = '${e(JSON.stringify({ ...movieData, tmdb: tmdbData }))}',
+        updated_at = ${Date.now()}
+      WHERE id = ${id}
+    `));
+
+    // Track usage
+    await trackUsage(edgespark, sql, STAGE1_MODEL, "stage1", STAGE1_COST_CENTS);
+
+    // Mark queue item done if processing via queue
+    await edgespark.db.all(sql.raw(`
+      UPDATE processing_queue SET status = 'done', completed_at = ${Date.now()}
+      WHERE image_id = ${id} AND stage = 'stage1' AND status = 'processing'
+    `));
+
+    return c.json({
+      success: true,
+      movie: movieData,
+      tmdb: tmdbData,
+      inventoryMatches,
+      suggestedMatch: inventoryMatches[0] || null
+    });
+
+  } catch (err: any) {
+    console.error("[Stage1] Gemini error:", err.message, err.stack);
+
+    await edgespark.db.all(sql.raw(`
+      UPDATE processing_queue SET status = 'failed', error = '${String(err.message).replace(/'/g, "''")}',
+      completed_at = ${Date.now()}
+      WHERE image_id = ${id} AND stage = 'stage1' AND status = 'processing'
+    `));
+
+    return c.json({
+      error: "Stage 1 identification failed: " + err.message,
+      details: err.stack
+    }, 500);
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════════
+// CONSOLIDATED STAGE 2: FORENSIC EXTRACTION
+// Replaces: the Provenance Engine /api/library/:id/identify validate step
+// ═══════════════════════════════════════════════════════════════
+app.post("/api/library/:id/forensic", async (c) => {
+  const id = parseInt(c.req.param("id"));
+  const body = await c.req.json() as {
+    country?: string;
+    format?: string;
+    yearStart?: number;
+    yearEnd?: number;
+  };
+
+  console.log("[Stage2] POST /api/library/:id/forensic", { id, body });
+
+  const geminiKey = edgespark.secret.get("GEMINI_API_KEY");
+  if (!geminiKey) return c.json({ error: "GEMINI_API_KEY not configured" }, 500);
+
+  const imgs = await edgespark.db.all<any>(sql.raw(`SELECT * FROM image_library WHERE id = ${id}`));
+  if (!imgs[0]) return c.json({ error: "Image not found" }, 404);
+  const img = imgs[0];
+
+  let file: any;
+  try {
     const { bucket, path: storagePath } = edgespark.storage.fromS3Uri(img.s3_uri);
-    const file = await edgespark.storage.from(bucket).get(storagePath);
+    file = await edgespark.storage.from(bucket).get(storagePath);
     if (!file) return c.json({ error: "Image file not found in storage" }, 404);
-    
-    // Convert to base64
+  } catch (err: any) {
+    console.error("[Stage2] Storage fetch failed:", err.message);
+    return c.json({ error: "Failed to fetch image: " + err.message }, 500);
+  }
+
+  let base64: string;
+  try {
     const bytes = new Uint8Array(file.body);
-    let binary = "";
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    const base64 = btoa(binary);
-    
-    // Build the forensic prompt with heuristic rules hard-coded
-    const heuristicRules = `
-    FORENSIC ANALYSIS RULES - Apply these hard-coded historical heuristics:
-    
-    ITALY ANALYSIS:
-    - Visto number #30,000-50,000 = 1959-1967
-    - Visto number #75,000+ = Post-1980s
-    - "S.p.A." suffix = Post-1950
-    
-    FRANCE ANALYSIS:
-    - "Saint-Martin" address (Rue Pascal) = Pre-1972
-    - "Lalande" address (Wissous) = 1965-1969
-    
-    USA ANALYSIS:
-    - NSS "R" prefix = Re-release (e.g., R68/12 means 1968 re-release)
-    - 5-digit Zip Codes = Post-1963 ONLY
-    
-    UK ANALYSIS:
-    - "15" or "18" rating = Post-1982 ONLY (BBFC introduced in 1982)
-    
-    For each zone, extract:
-    - Header (Top 15%): Studio logos, "Re-presents" text
-    - Footer (Bottom 20%): Printer credits, NSS/Visa numbers
-    - Right Margin (Right 15%): Visto di Censura stamps (Italy), rating logos
-    `;
-    
-    const prompt = `You are a forensic movie poster analyst. Analyze this poster using the zonal extraction methodology.
-    
-${heuristicRules}
+    base64 = bytesToBase64(bytes);
+  } catch (err: any) {
+    console.error("[Stage2] Base64 conversion failed:", err.message);
+    return c.json({ error: "Failed to process image: " + err.message }, 500);
+  }
 
-Expected era: ${yearRangeStart || "unknown"}-${yearRangeEnd || "unknown"}
-Poster format: ${posterFormat || "unknown"}
-Poster country: ${posterCountry || "unknown"}
-Release type: ${releaseType}
+  const mimeType = file.metadata?.contentType || "image/jpeg";
+  const ai = new GoogleGenAI({ apiKey: geminiKey });
 
-Extract text from the three forensic zones and return JSON:
-{
-  "header_text": "Text from top 15% (studio logos, re-presents)",
-  "footer_text": "Text from bottom 20% (printer credits, NSS/visa)",
-  "margin_text": "Text from right 15% (censura stamps, ratings)",
-  "printer_credit": "Printer name if found",
-  "nss_visa_code": "NSS or Visa number (e.g., R68/12, Visto 45678)",
-  "distributor_logo": "Distributor/studio name",
-  "anachronisms": [
-    {
-      "type": "anachronism|mismatch",
-      "zone": "header|footer|margin",
-      "description": "What was found that doesn't match the expected era"
-    }
-  ],
-  "validation_status": "verified|incomplete|anachronism|mismatch",
-  "confidence": 0-100
-}
+  // Use lot_number context if batch context not provided
+  const country = body.country || img.poster_country || "";
+  const yearStart = body.yearStart || img.year_range_start || 0;
+  const yearEnd = body.yearEnd || img.year_range_end || 0;
 
-If OCR returns < 10 characters, set validation_status to "incomplete" and explain in notes.`;
+  // Build country-specific rules section
+  const countryRules = buildCountryRules(country, yearStart, yearEnd);
 
+  // Build known printer/distributor lists for this country
+  const printerList = getKnownPrinters(country);
+  const distributorList = KNOWN_DISTRIBUTORS.join(", ");
+
+  const systemPrompt = `You are an expert forensic movie poster archivist. Analyze this poster image.
+
+FOCUS REGIONS (in order of forensic priority):
+1. Lower 15% of image (bounding box top 85% to bottom): billing block with printer credits, NSS/visa codes, edition markings, tax stamps
+2. Lower-left margin (extreme left edge, bottom 40%): vertical printer text, regional stamps
+3. Lower-right margin (extreme right edge, bottom 40%): edition year codes, censorship stamps, rating logos
+4. Upper header (top 10%): distributor/studio logos, re-issue indicators
+
+KNOWN PRINTERS FOR THIS REGION: ${printerList}
+KNOWN DISTRIBUTORS: ${distributorList}
+
+COUNTRY-SPECIFIC RULES:
+${countryRules}
+
+CRITICAL RULES:
+- For EACH field: if you cannot identify with 95% certainty, return empty string. DO NOT hallucinate.
+- "Prima Edizione" or "Prima Edizione Italiana" = original first release
+- "Edizione Successiva" or "Riedizione" = explicit reissue
+- NSS codes: format YY/NNNN (e.g. 68/201). Reissue prefix: R + YY/NNNN (e.g. R78/42)
+- French posters: IGNORE the year 1881 if preceded by "Loi du" or "Juillet" — it is a legal boilerplate code, NOT a release year
+- Italian posters: "Zincografica", "Fotolito", "Rotocalco", "Fotocromocombinazione" = printing method sub-contractors, NOT distributors
+- Double-feature poster: if "I GRANDI SUCCESSI" / "ACCOPPIATA" / "DOPPIO SPETTACOLO" present, set is_double_feature true`;
+
+  const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+  const responseSchema = {
+    type: "OBJECT",
+    properties: {
+      printer_credit: { type: "STRING", description: "Printer name and location from border" },
+      printer_method: { type: "STRING", description: "Printing method sub-contractor if separate (Zincografica, Fotolito, etc)" },
+      studio_distributor: { type: "STRING", description: "Distributor/studio name matched against known list" },
+      studio_distributor_raw: { type: "STRING", description: "Exact text as it appears on poster" },
+      censorship_number: { type: "STRING", description: "Visto/Visa/NSS/Eirin number exactly as printed" },
+      censorship_type: { type: "STRING", description: "Type: Visto di Censura / Visa d'exploitation / NSS / Eirin / BBFC / Australian / other" },
+      edition_marking: { type: "STRING", description: "Prima Edizione / Edizione Successiva / R-prefix / Prima Visione / etc" },
+      tax_stamp: { type: "STRING", description: "Tax stamp denomination and type (e.g. L.30 Imposta Pubblicità)" },
+      year_codes: { type: "STRING", description: "Any year or date codes found in margins" },
+      bbfc_rating: { type: "STRING", description: "UK BBFC rating symbol if present: U/A/H/X/PG/12/15/18" },
+      australian_classification: { type: "STRING", description: "Australian classification if present: G/NRC/M/R or text classification" },
+      catch_all: { type: "STRING", description: "Any other printed/stamped text not captured above" },
+      is_original: { type: "BOOLEAN", description: "True if evidence points to original first release" },
+      is_reissue: { type: "BOOLEAN", description: "True if evidence points to reissue" },
+      is_double_feature: { type: "BOOLEAN" },
+      conflict_flags: {
+        type: "ARRAY",
+        items: { type: "STRING" },
+        description: "List of anachronisms or mismatches found"
+      },
+      validation_status: {
+        type: "STRING",
+        enum: ["verified_original", "verified_reissue", "likely_original", "likely_reissue", "anachronism", "incomplete", "uncertain"]
+      },
+      confidence: { type: "NUMBER" }
+    },
+    required: [
+      "printer_credit", "printer_method", "studio_distributor",
+      "censorship_number", "censorship_type", "edition_marking",
+      "tax_stamp", "year_codes", "catch_all",
+      "is_original", "is_reissue", "is_double_feature",
+      "conflict_flags", "validation_status", "confidence"
+    ]
+  };
+
+  try {
+    const result = await geminiWithRetry(ai, {
+      model: STAGE2_MODEL,
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema,
+      },
+      contents: [{
+        role: "user",
+        parts: [{ text: systemPrompt }, { inlineData: { data: base64, mimeType } }]
+      }]
+    });
+
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    let forensicData: any;
     try {
-      const ai = new GoogleGenAI({ apiKey: geminiKey });
-      
-      const result = await ai.models.generateContent({
-        model: "gemini-2.5-flash-lite",
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { text: prompt },
-              { inlineData: { data: base64, mimeType: "image/jpeg" } }
-            ]
-          }
-        ]
-      });
-      
-      const text = result.text || "";
-      console.log("[API] Gemini validate response:", text.substring(0, 500));
-      
-      // Extract JSON from response
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        return c.json({ error: "Could not parse forensic data from image", raw: text }, 422);
-      }
-      
-      const forensicData = JSON.parse(jsonMatch[0]);
-      
-      // Apply additional heuristic validation
-      const anachronisms = forensicData.anachronisms || [];
-      const ocrRaw = `${forensicData.header_text || ""} ${forensicData.footer_text || ""} ${forensicData.margin_text || ""}`;
-      
-      // Italy heuristics
-      const vistoMatch = ocrRaw.match(/Visto[^\d]*(\d+)/i);
-      if (vistoMatch) {
-        const vistoNum = parseInt(vistoMatch[1]);
-        if (vistoNum > 60000 && yearRangeEnd && parseInt(yearRangeEnd) < 1970) {
-          anachronisms.push({ type: "anachronism", zone: "footer", description: `Visto #${vistoNum} is post-1970 but expected era ends in ${yearRangeEnd}` });
+      forensicData = JSON.parse(text);
+    } catch {
+      return c.json({ error: "Failed to parse Gemini forensic response", raw: text }, 422);
+    }
+
+    // Apply code-side heuristic validation (existing logic, now fed by real data)
+    const anachronisms = [...(forensicData.conflict_flags || [])];
+
+    // Italy: tax stamp era check
+    if (country.toLowerCase().includes("ital") && forensicData.tax_stamp) {
+      const liraMatch = forensicData.tax_stamp.match(/L\.\s*(\d+)/i);
+      if (liraMatch) {
+        const lira = parseInt(liraMatch[1]);
+        if (lira >= 50 && yearEnd && yearEnd < 1975) {
+          anachronisms.push(`Tax stamp L.${lira} suggests post-1975 but expected era ends ${yearEnd}`);
         }
       }
-      if (ocrRaw.match(/S\.p\.A\./i) && yearRangeEnd && parseInt(yearRangeEnd) < 1950) {
-        anachronisms.push({ type: "anachronism", zone: "header", description: "S.p.A. suffix found but expected era pre-1950" });
+    }
+
+    // Italy: Visto di Censura era check
+    if (forensicData.censorship_type?.includes("Visto") && forensicData.censorship_number) {
+      const vistoNum = parseInt(forensicData.censorship_number.replace(/[^0-9]/g, ""));
+      if (vistoNum > 0) {
+        if (vistoNum > 73000 && yearEnd && yearEnd < 1980) {
+          anachronisms.push(`Visto #${vistoNum} suggests post-1980 but expected era ends ${yearEnd}`);
+        } else if (vistoNum > 55000 && yearEnd && yearEnd < 1970) {
+          anachronisms.push(`Visto #${vistoNum} suggests post-1970 but expected era ends ${yearEnd}`);
+        }
       }
-      
-      // France heuristics
-      if (ocrRaw.match(/Wissous/i) && yearRangeEnd && parseInt(yearRangeEnd) < 1965) {
-        anachronisms.push({ type: "anachronism", zone: "footer", description: "Lalande printer (Wissous addr) but expected era pre-1965" });
+    }
+
+    // France: postal code era check
+    if (forensicData.printer_credit?.match(/75\d{3}/)) {
+      if (yearEnd && yearEnd < 1972) {
+        anachronisms.push(`5-digit Paris postal code found but expected era ends ${yearEnd} (post-1972 indicator)`);
       }
-      
-      // USA heuristics
-      const zipMatch = ocrRaw.match(/\b\d{5}\b/);
-      if (zipMatch && yearRangeEnd && parseInt(yearRangeEnd) < 1963) {
-        anachronisms.push({ type: "anachronism", zone: "footer", description: "5-digit zip code found but expected era pre-1963" });
+    }
+
+    // NSS reissue prefix check
+    if (forensicData.censorship_number?.match(/^R\d{2}\//)) {
+      if (!forensicData.is_reissue) {
+        anachronisms.push(`NSS "R" prefix ${forensicData.censorship_number} indicates reissue`);
+        forensicData.is_reissue = true;
+        forensicData.is_original = false;
       }
-      const nssRMatch = ocrRaw.match(/R\d+\/\d+/i);
-      if (nssRMatch && releaseType === "Original") {
-        anachronisms.push({ type: "mismatch", zone: "footer", description: `NSS "R" prefix found (${nssRMatch[0]}) but release type is Original` });
+    }
+
+    // UK BBFC era check
+    if (forensicData.bbfc_rating && ["15", "18", "12", "PG"].includes(forensicData.bbfc_rating)) {
+      if (yearEnd && yearEnd < 1982) {
+        anachronisms.push(`BBFC "${forensicData.bbfc_rating}" rating introduced 1982 but expected era ends ${yearEnd}`);
       }
-      
-      // UK heuristics
-      if (ocrRaw.match(/\b(15|18)\b/) && yearRangeEnd && parseInt(yearRangeEnd) < 1982) {
-        anachronisms.push({ type: "anachronism", zone: "margin", description: "BBFC 15/18 rating found but expected era pre-1982" });
-      }
-      
-      // Determine final status
-      let validationStatus = forensicData.validation_status || "pending";
-      if (anachronisms.some((a: any) => a.type === "anachronism")) {
-        validationStatus = "anachronism";
-      } else if (anachronisms.some((a: any) => a.type === "mismatch")) {
-        validationStatus = "mismatch";
-      } else if (ocrRaw.length < 10) {
-        validationStatus = "incomplete";
-      } else if (validationStatus === "incomplete") {
-        validationStatus = "verified";
-      }
-      
-      // Update library record with forensic data
-      await edgespark.db.all(sql.raw(`
-        UPDATE image_library SET 
-          printer_credit = '${(forensicData.printer_credit || "").replace(/'/g, "''")}',
-          nss_visa_code = '${(forensicData.nss_visa_code || "").replace(/'/g, "''")}',
-          distributor_logo = '${(forensicData.distributor_logo || "").replace(/'/g, "''")}',
-          poster_country = '${(posterCountry || "").replace(/'/g, "''")}',
-          dna_audit_status = '${validationStatus}',
-          dna_ocr_raw = '${ocrRaw.replace(/'/g, "''")}',
-          dna_forensic_crops = '${JSON.stringify(forensicData).replace(/'/g, "''")}',
-          updated_at = ${Date.now()}
-        WHERE id = ${id}
+    }
+
+    // CIC/UIP distributor = post-1970/1981
+    const dist = forensicData.studio_distributor?.toUpperCase() || "";
+    if ((dist.includes("CIC") || dist.includes("CINEMA INTERNATIONAL")) && yearEnd && yearEnd < 1970) {
+      anachronisms.push(`CIC distribution logo suggests post-1970 but expected era ends ${yearEnd}`);
+    }
+    if ((dist.includes("UIP") || dist.includes("UNITED INTERNATIONAL")) && yearEnd && yearEnd < 1981) {
+      anachronisms.push(`UIP distribution logo suggests post-1981 but expected era ends ${yearEnd}`);
+    }
+
+    // Determine final validation status
+    let validationStatus = forensicData.validation_status;
+    if (anachronisms.length > 0 && validationStatus === "likely_original") {
+      validationStatus = "anachronism";
+    }
+
+    const e = (s: any) => String(s || "").replace(/'/g, "''");
+
+    // Save forensic results to image_library
+    await edgespark.db.all(sql.raw(`
+      UPDATE image_library SET
+        printer_credit = '${e(forensicData.printer_credit)}',
+        distributor_logo = '${e(forensicData.studio_distributor)}',
+        nss_visa_code = '${e(forensicData.censorship_number)}',
+        release_type = '${validationStatus.includes("reissue") ? "Reissue" : validationStatus.includes("original") ? "Original" : "Unknown"}',
+        conflict_status = '${e(validationStatus)}',
+        conflict_reason = '${e(anachronisms.join("; "))}',
+        dna_audit_status = '${e(validationStatus)}',
+        dna_forensic_crops = '${e(JSON.stringify(forensicData))}',
+        dna_ocr_raw = '${e([forensicData.printer_credit, forensicData.censorship_number, forensicData.edition_marking, forensicData.catch_all].filter(Boolean).join(" "))}',
+        updated_at = ${Date.now()}
+      WHERE id = ${id}
+    `));
+
+    await trackUsage(edgespark, sql, STAGE2_MODEL, "stage2", STAGE2_COST_CENTS);
+
+    await edgespark.db.all(sql.raw(`
+      UPDATE processing_queue SET status = 'done', completed_at = ${Date.now()}
+      WHERE image_id = ${id} AND stage = 'stage2' AND status = 'processing'
+    `));
+
+    return c.json({
+      success: true,
+      forensic: { ...forensicData, conflict_flags: anachronisms, validation_status: validationStatus }
+    });
+
+  } catch (err: any) {
+    console.error("[Stage2] Gemini error:", err.message);
+
+    await edgespark.db.all(sql.raw(`
+      UPDATE processing_queue SET status = 'failed', error = '${String(err.message).replace(/'/g, "''")}',
+      completed_at = ${Date.now()}
+      WHERE image_id = ${id} AND stage = 'stage2' AND status = 'processing'
+    `));
+
+    return c.json({ error: "Stage 2 forensic failed: " + err.message }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// MODE B: TARGETED SINGLE QUESTION
+// Ask one specific forensic question about a specific poster
+// ═══════════════════════════════════════════════════════════════
+app.post("/api/library/:id/ask", async (c) => {
+  const id = parseInt(c.req.param("id"));
+  const { question, country, yearStart, yearEnd } = await c.req.json() as {
+    question: string;
+    country?: string;
+    yearStart?: number;
+    yearEnd?: number;
+  };
+
+  if (!question?.trim()) return c.json({ error: "question is required" }, 400);
+
+  const geminiKey = edgespark.secret.get("GEMINI_API_KEY");
+  if (!geminiKey) return c.json({ error: "GEMINI_API_KEY not configured" }, 500);
+
+  const imgs = await edgespark.db.all<any>(sql.raw(`SELECT * FROM image_library WHERE id = ${id}`));
+  if (!imgs[0]) return c.json({ error: "Image not found" }, 404);
+  const img = imgs[0];
+
+  let file: any;
+  try {
+    const { bucket, path: storagePath } = edgespark.storage.fromS3Uri(img.s3_uri);
+    file = await edgespark.storage.from(bucket).get(storagePath);
+    if (!file) return c.json({ error: "Image not found in storage" }, 404);
+  } catch (err: any) {
+    return c.json({ error: "Failed to fetch image: " + err.message }, 500);
+  }
+
+  let base64: string;
+  try {
+    base64 = bytesToBase64(new Uint8Array(file.body));
+  } catch (err: any) {
+    return c.json({ error: "Failed to process image: " + err.message }, 500);
+  }
+
+  const mimeType = file.metadata?.contentType || "image/jpeg";
+  const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+  const existingData = img.identified_title ?
+    `Previously identified as: ${img.identified_title} (${img.identified_year || "year unknown"})` : "";
+
+  const countryRules = (country || img.poster_country) ?
+    buildCountryRules(country || img.poster_country, yearStart || 0, yearEnd || 0) : "";
+
+  const prompt = `You are an expert forensic movie poster archivist. A collector is asking you a specific question about this poster.
+
+${existingData}
+${countryRules}
+
+FOCUS on the poster border regions (left edge, right edge, bottom strip, top header) when looking for forensic details.
+If the question is about whether this is an original or reissue, check: Visto/Visa numbers, NSS codes, BBFC ratings, printer addresses, edition markings, distributor logos.
+
+QUESTION: ${question}
+
+Give a specific, direct answer based on what you can see in the image. Reference specific visual evidence (e.g. "I can see 'Visto di Censura N. 42183' in the lower right, which places this in the early 1960s"). If you cannot determine the answer with confidence, say so clearly and explain why.`;
+
+  try {
+    const result = await geminiWithRetry(ai, {
+      model: STAGE2_MODEL,
+      contents: [{
+        role: "user",
+        parts: [{ text: prompt }, { inlineData: { data: base64, mimeType } }]
+      }]
+    });
+
+    const answer = result.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    await trackUsage(edgespark, sql, STAGE2_MODEL, "ask", STAGE2_COST_CENTS);
+
+    return c.json({ success: true, question, answer });
+
+  } catch (err: any) {
+    console.error("[Ask] Gemini error:", err.message);
+    return c.json({ error: "Question failed: " + err.message }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PROCESSING QUEUE — add posters for batch processing
+// ═══════════════════════════════════════════════════════════════
+app.post("/api/admin/media-library/queue", async (c) => {
+  const { imageIds, batchContext } = await c.req.json() as {
+    imageIds: number[];
+    batchContext?: {
+      country?: string;
+      format?: string;
+      yearStart?: number;
+      yearEnd?: number;
+    };
+  };
+
+  if (!Array.isArray(imageIds) || imageIds.length === 0) {
+    return c.json({ error: "imageIds array required" }, 400);
+  }
+
+  const ts = Date.now();
+  const contextStr = batchContext ? JSON.stringify(batchContext).replace(/'/g, "''") : "{}";
+  let queued = 0;
+
+  for (const imageId of imageIds) {
+    // Add Stage 1 first, Stage 2 second (sequential processing)
+    for (const stage of ["stage1", "stage2"]) {
+      // Check not already queued/processing
+      const existing = await edgespark.db.all<any>(sql.raw(`
+        SELECT id FROM processing_queue
+        WHERE image_id = ${imageId} AND stage = '${stage}'
+        AND status IN ('pending', 'processing')
       `));
-      
-      return c.json({
-        success: true,
-        stage: "validate",
-        forensicData,
-        anachronisms,
-        validationStatus,
-        quotaUsed: 3
-      });
-      
-    } catch (error: any) {
-      console.error("[API] Validate error:", error.message);
-      return c.json({ error: "Validation failed: " + error.message }, 500);
+      if (existing.length === 0) {
+        await edgespark.db.all(sql.raw(`
+          INSERT INTO processing_queue (image_id, stage, status, batch_context, queued_at, created_at)
+          VALUES (${imageId}, '${stage}', 'pending', '${contextStr}', ${ts}, ${ts})
+        `));
+        queued++;
+      }
+    }
+  }
+
+  return c.json({ success: true, queued, total: imageIds.length * 2 });
+});
+
+app.get("/api/admin/media-library/queue", async (c) => {
+  const [queueStats, todayUsage, pendingItems] = await Promise.all([
+    edgespark.db.all<any>(sql.raw(`
+      SELECT stage, status, COUNT(*) as count
+      FROM processing_queue
+      GROUP BY stage, status
+      ORDER BY stage, status
+    `)),
+    edgespark.db.all<any>(sql.raw(`
+      SELECT model, stage, calls, estimated_cost_cents, last_call_at
+      FROM api_usage_log
+      WHERE date = '${new Date().toISOString().split("T")[0]}'
+      ORDER BY stage
+    `)),
+    edgespark.db.all<any>(sql.raw(`
+      SELECT q.id, q.image_id, q.stage, q.status, q.queued_at, q.error,
+             il.identified_title, il.filename
+      FROM processing_queue q
+      LEFT JOIN image_library il ON il.id = q.image_id
+      WHERE q.status IN ('pending', 'failed')
+      ORDER BY q.queued_at ASC
+      LIMIT 50
+    `))
+  ]);
+
+  const totalCallsToday = todayUsage.reduce((sum: number, r: any) => sum + r.calls, 0);
+  const totalCostCentsToday = todayUsage.reduce((sum: number, r: any) => sum + r.estimated_cost_cents, 0);
+  const pendingCount = queueStats.filter((r: any) => r.status === "pending")
+    .reduce((sum: number, r: any) => sum + r.count, 0);
+
+  return c.json({
+    queue: {
+      stats: queueStats,
+      pending: pendingItems,
+      pendingCount,
+    },
+    usage: {
+      today: todayUsage,
+      totalCallsToday,
+      estimatedCostCentsToday: totalCostCentsToday,
+      estimatedCostDollarsToday: (totalCostCentsToday / 100).toFixed(4),
     }
   });
+});
+
+// Process next item in queue (called by frontend poller)
+app.post("/api/admin/media-library/queue/process-next", async (c) => {
+  // Get next pending stage1 item
+  const [nextItem] = await edgespark.db.all<any>(sql.raw(`
+    SELECT * FROM processing_queue
+    WHERE status = 'pending'
+    ORDER BY stage ASC, queued_at ASC
+    LIMIT 1
+  `));
+
+  if (!nextItem) return c.json({ done: true, message: "Queue is empty" });
+
+  // Mark as processing
+  await edgespark.db.all(sql.raw(`
+    UPDATE processing_queue SET status = 'processing', started_at = ${Date.now()}
+    WHERE id = ${nextItem.id}
+  `));
+
+  // Parse batch context
+  let batchContext = {};
+  try { batchContext = JSON.parse(nextItem.batch_context || "{}"); } catch {}
+
+  // Call the appropriate stage endpoint internally
+  const endpoint = nextItem.stage === "stage1" ?
+    `/api/library/${nextItem.image_id}/identify` :
+    `/api/library/${nextItem.image_id}/forensic`;
+
+  // We return the work to be done — the frontend poller handles the actual call
+  return c.json({
+    done: false,
+    nextItem: {
+      queueId: nextItem.id,
+      imageId: nextItem.image_id,
+      stage: nextItem.stage,
+      endpoint,
+      batchContext
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+app.get("/api/admin/media-library/pending-matches", async (c) => {
+  const minConfidence = parseFloat(c.req.query("minConfidence") || "0");
+
+  const pending = await edgespark.db.all<any>(sql.raw(`
+    SELECT
+      il.id as image_id,
+      il.filename,
+      il.identified_title,
+      il.identified_year,
+      il.identified_director,
+      il.suggested_inventory_id,
+      il.match_confidence,
+      il.s3_uri,
+      il.thumbnail_url,
+      i.title as inventory_title,
+      i.year as inventory_year,
+      i.format as inventory_format,
+      i.lot_id as inventory_lot_id
+    FROM image_library il
+    LEFT JOIN inventory i ON i.id = il.suggested_inventory_id
+    WHERE il.match_status = 'suggested'
+    AND il.suggested_inventory_id IS NOT NULL
+    AND il.match_confidence >= ${minConfidence}
+    ORDER BY il.match_confidence DESC, il.updated_at DESC
+  `));
+
+  // Group by confidence tier for the UI
+  const high = pending.filter((p: any) => p.match_confidence >= 0.9);
+  const medium = pending.filter((p: any) => p.match_confidence >= 0.7 && p.match_confidence < 0.9);
+  const low = pending.filter((p: any) => p.match_confidence < 0.7);
+
+  return c.json({
+    total: pending.length,
+    tiers: { high, medium, low },
+    all: pending
+  });
+});
+
 
   // ═══════════════════════════════════════════════════════════
   // EBAY COMMAND BRIDGE - FRAME AND REEL
@@ -6927,4 +7621,3 @@ Return JSON with these fields:
 
   return app;
 }
-
