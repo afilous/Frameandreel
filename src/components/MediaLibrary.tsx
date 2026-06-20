@@ -1,3 +1,17 @@
+// ═══════════════════════════════════════════════════════════════
+// CLAUDE-EDIT: 2026-06-20 | Frontend consolidation — replaced Provenance
+// Engine handleIdentify/handleValidate (old /identify, /validate calls)
+// and handleAutoId/handleAiIdentify button wiring with one consolidated
+// "Identify & Verify" flow calling /api/library/:id/identify (Stage 1)
+// and /forensic (Stage 2). Added batch context inputs, queue status
+// widget, Mode A (retry with correction) and Mode B (ask a question) UI.
+// Removed Glass Box header/footer/margin zone display (backend no
+// longer returns that shape). Fixed existing Pending Matches table to
+// call the correct batch-confirm endpoint (was calling an eBay-listing
+// endpoint by mistake). Edited via Claude chat, manually uploaded to
+// GitHub by Aaron. Search this project for "CLAUDE-EDIT: 2026-06-20"
+// for full context.
+// ═══════════════════════════════════════════════════════════════
 import { useState, useEffect, useRef, useCallback, memo } from "react";
 import { createEdgeSpark } from "@edgespark/client";
 import Tesseract from "tesseract.js";
@@ -565,6 +579,22 @@ function canvasToBlob(canvas: HTMLCanvasElement, type = "image/jpeg", quality = 
   });
 }
 
+// Small helper for the Identify & Verify results panel — shows a label/value
+// row with an optional edit affordance (used by Mode A: retry-with-correction)
+function FieldRow({ label, value, onEdit }: { label: string; value?: string; onEdit?: () => void }) {
+  return (
+    <div className="flex justify-between items-baseline border-b border-gray-100 py-1">
+      <span className="text-gray-500">{label}</span>
+      <span className="flex items-center gap-1">
+        <span className="font-medium">{value || <span className="text-gray-300">—</span>}</span>
+        {onEdit && (
+          <button onClick={onEdit} className="text-gray-400 hover:text-gray-700 text-xs" title="Correct this">✎</button>
+        )}
+      </span>
+    </div>
+  );
+}
+
 export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventory?: () => void }) {
   const [images, setImages] = useState<LibImage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -629,29 +659,44 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
   // ═══════════════════════════════════════════════════
   
   // Quota Dashboard
-  const [quotaUsed, setQuotaUsed] = useState(0);
-  const QUOTA_LIMIT = 500;
+  // ═══════════════════════════════════════════════════════════
+  // CONSOLIDATED IDENTIFY & VERIFY STATE (replaces Provenance Engine
+  // quota/forensicCrops/validationStatus state — backend endpoints
+  // /api/library/:id/identify and /validate were replaced with
+  // /identify (Stage 1) and /forensic (Stage 2))
+  // ═══════════════════════════════════════════════════════════
+  const [identifyResult, setIdentifyResult] = useState<{
+    img: LibImage;
+    stage1?: any;
+    stage2?: any;
+    inventoryMatches?: any[];
+  } | null>(null);
+  const [identifyLoading, setIdentifyLoading] = useState<{ stage: 1 | 2 | null; imageId: number | null }>({ stage: null, imageId: null });
+  const [batchContext, setBatchContext] = useState<{
+    country: string;
+    format: string;
+    yearStart: string;
+    yearEnd: string;
+  }>({ country: "", format: "", yearStart: "", yearEnd: "" });
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askAnswer, setAskAnswer] = useState<string | null>(null);
+  const [askLoading, setAskLoading] = useState(false);
+  const [queueStatus, setQueueStatus] = useState<any>(null);
+  const [editingField, setEditingField] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+  // NOTE: a working pending-matches approval UI already exists further
+  // down in this file (filterStatus === "pending_matches" table view),
+  // using the existing `pendingMatches` filtered array + selectedIds.
+  // That UI's approve action was fixed to call the correct endpoint
+  // (/api/admin/media-library/batch-confirm-matches) rather than
+  // building a separate, redundant tiered-tabs UI here.
   
   // Tools Dropdown Menu
   const [showToolsMenu, setShowToolsMenu] = useState(false);
   
-  // Glass Box Panel (Forensic Strip)
-  const [showGlassBox, setShowGlassBox] = useState(false);
-  const [forensicCrops, setForensicCrops] = useState<{
-    header: string;
-    footer: string;
-    margin: string;
-  } | null>(null);
-  const [rawOcrLog, setRawOcrLog] = useState("");
-  const [validationStatus, setValidationStatus] = useState<"verified" | "incomplete" | "anachronism" | "mismatch" | "pending">("pending");
-  
   // Lot Year Range Configuration Modal
   const [showLotYearModal, setShowLotYearModal] = useState(false);
   const [editingLotYear, setEditingLotYear] = useState<{ lot: string; minYear: string; maxYear: string } | null>(null);
-  
-  // Provenance processing state
-  const [provenanceProcessing, setProvenanceProcessing] = useState(false);
-  const [provenanceStage, setProvenanceStage] = useState<"identify" | "validate" | null>(null);
 
   // ═══════════════════════════════════════════════════
   // LOGIC CONFLICT VISUALIZER - Lot Year Ranges
@@ -986,161 +1031,160 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
   };
 
   // ═══════════════════════════════════════════════════
-  // PROVENANCE ENGINE v2.0 - HANDLER FUNCTIONS
+  // CONSOLIDATED IDENTIFY & VERIFY HANDLERS (replaces Provenance
+  // Engine handleIdentify/handleValidate/handleLegacyId — backend
+  // endpoints changed to /api/library/:id/identify (Stage 1) and
+  // /api/library/:id/forensic (Stage 2))
   // ═══════════════════════════════════════════════════
 
-  // Stage 1: Identify & Link (1 unit)
-  const handleIdentify = async (imageId: number, options: {
-    director?: string;
-    actor?: string;
-    posterFormat?: string;
-    posterCountry?: string;
-    yearRangeStart?: string;
-    yearRangeEnd?: string;
-  }) => {
-    if (quotaUsed + 1 > QUOTA_LIMIT) {
-      setProcessingLabel("Quota exceeded! Upgrade to continue.");
-      return;
-    }
-    
-    setProvenanceProcessing(true);
-    setProvenanceStage("identify");
-    setProcessingLabel("🔍 Identifying poster (Stage 1)...");
-    
+  async function handleIdentifyAndVerify(img: LibImage) {
+    setIdentifyLoading({ stage: 1, imageId: img.id });
+    setIdentifyResult(null);
+
+    const context = {
+      country: batchContext.country || img.poster_country || undefined,
+      format: batchContext.format || img.poster_format || undefined,
+      yearStart: batchContext.yearStart ? parseInt(batchContext.yearStart) : (img.identified_year ? img.identified_year - 5 : undefined),
+      yearEnd: batchContext.yearEnd ? parseInt(batchContext.yearEnd) : (img.identified_year ? img.identified_year + 5 : undefined),
+    };
+
     try {
-      console.log("[PROVENANCE] Starting Stage 1 identify for image", imageId, options);
-      
-      const res = await client.api.fetch(`/api/library/${imageId}/identify`, {
+      const stage1Res = await client.api.fetch(`/api/library/${img.id}/identify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          director: options.director,
-          actor: options.actor,
-          posterFormat: options.posterFormat,
-          posterCountry: options.posterCountry,
-          yearRangeStart: options.yearRangeStart,
-          yearRangeEnd: options.yearRangeEnd,
-          mediaResolution: "low"
-        }),
+        body: JSON.stringify(context),
       });
-      
-      console.log("[PROVENANCE] Stage 1 response status:", res.status);
-      
-      if (!res.ok) {
-        const errorText = await res.text();
-        console.error("[PROVENANCE] Stage 1 error response:", errorText);
-        throw new Error(`API ${res.status}: ${errorText}`);
+      const stage1Data = await stage1Res.json();
+
+      if (!stage1Res.ok) {
+        setProcessingLabel(`❌ Identification failed: ${stage1Data.error || "Unknown error"}`);
+        setIdentifyLoading({ stage: null, imageId: null });
+        return;
       }
-      
+
+      setIdentifyResult({ img, stage1: stage1Data.movie, inventoryMatches: stage1Data.inventoryMatches });
+      setIdentifyLoading({ stage: 2, imageId: img.id });
+      setProcessingLabel("🔬 Running forensic scan...");
+
+      const stage2Res = await client.api.fetch(`/api/library/${img.id}/forensic`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(context),
+      });
+      const stage2Data = await stage2Res.json();
+
+      if (!stage2Res.ok) {
+        setIdentifyResult(prev => prev ? { ...prev, stage2: { error: stage2Data.error } } : null);
+        setProcessingLabel(`⚠️ Forensic scan failed: ${stage2Data.error || "Unknown error"}`);
+        setIdentifyLoading({ stage: null, imageId: null });
+        return;
+      }
+
+      setIdentifyResult(prev => prev ? { ...prev, stage2: stage2Data.forensic } : null);
+      setProcessingLabel("✅ Identify & Verify complete!");
+      setIdentifyLoading({ stage: null, imageId: null });
+      fetchImages();
+
+    } catch (err: any) {
+      setProcessingLabel(`❌ Error: ${err.message}`);
+      setIdentifyLoading({ stage: null, imageId: null });
+    }
+  }
+
+  // Mode A: re-run Stage 1 with a corrected fact
+  async function handleRetryWithCorrection(img: LibImage, field: string, value: string) {
+    const context: any = {
+      country: batchContext.country || img.poster_country || undefined,
+      format: batchContext.format || img.poster_format || undefined,
+      yearStart: batchContext.yearStart ? parseInt(batchContext.yearStart) : undefined,
+      yearEnd: batchContext.yearEnd ? parseInt(batchContext.yearEnd) : undefined,
+    };
+    if (field === "director") context.knownDirector = value;
+    if (field === "actors") context.knownActors = value;
+    if (field === "title") context.knownTitle = value;
+    if (field === "year") context.knownYear = parseInt(value);
+
+    setIdentifyLoading({ stage: 1, imageId: img.id });
+    try {
+      const res = await client.api.fetch(`/api/library/${img.id}/identify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(context),
+      });
       const data = await res.json();
-      setQuotaUsed(prev => prev + (data.quotaUsed || 1));
-      
-      if (data.yearWarning) {
-        setProcessingLabel(`⚠️ ${data.yearWarning}`);
-        setTimeout(() => setProcessingLabel(""), 5000);
+      if (res.ok) {
+        setIdentifyResult(prev => prev ? { ...prev, stage1: data.movie, inventoryMatches: data.inventoryMatches } : { img, stage1: data.movie, inventoryMatches: data.inventoryMatches });
       } else {
-        setProcessingLabel("✅ Identification complete!");
+        setProcessingLabel(`❌ Retry failed: ${data.error}`);
       }
-      
-      fetchImages();
-      return data;
     } catch (err: any) {
-      console.error("[PROVENANCE] Stage 1 FAILED:", err);
-      setProcessingLabel(`❌ Identify failed: ${err.message}`);
-    } finally {
-      setProvenanceProcessing(false);
-      setProvenanceStage(null);
+      setProcessingLabel(`❌ Error: ${err.message}`);
     }
-  };
+    setIdentifyLoading({ stage: null, imageId: null });
+    setEditingField(null);
+  }
 
-  // Stage 2: Era Validator (3 units)
-  const handleValidate = async (imageId: number, options: {
-    posterFormat?: string;
-    releaseType?: string;
-    yearRangeStart?: string;
-    yearRangeEnd?: string;
-  }) => {
-    if (quotaUsed + 3 > QUOTA_LIMIT) {
-      setProcessingLabel("Quota exceeded! Upgrade to continue.");
-      return;
-    }
-    
-    setProvenanceProcessing(true);
-    setProvenanceStage("validate");
-    setProcessingLabel("🔬 Validating era (Stage 2 - Forensic)...");
-    setShowGlassBox(true);
-    
+  // Mode B: ask a targeted forensic question
+  async function handleAskQuestion(img: LibImage) {
+    if (!askQuestion.trim()) return;
+    setAskLoading(true);
+    setAskAnswer(null);
     try {
-      console.log("[PROVENANCE] Starting Stage 2 validate for image", imageId, options);
-      
-      const res = await client.api.fetch(`/api/library/${imageId}/validate`, {
+      const res = await client.api.fetch(`/api/library/${img.id}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          posterFormat: options.posterFormat,
-          releaseType: options.releaseType || "Original",
-          yearRangeStart: options.yearRangeStart,
-          yearRangeEnd: options.yearRangeEnd,
+          question: askQuestion,
+          country: batchContext.country || img.poster_country || undefined,
+          yearStart: batchContext.yearStart ? parseInt(batchContext.yearStart) : undefined,
+          yearEnd: batchContext.yearEnd ? parseInt(batchContext.yearEnd) : undefined,
         }),
       });
-      
-      console.log("[PROVENANCE] Stage 2 response status:", res.status);
-      
-      if (!res.ok) {
-        const errorText = await res.text();
-        console.error("[PROVENANCE] Stage 2 error response:", errorText);
-        throw new Error(`API ${res.status}: ${errorText}`);
-      }
-      
       const data = await res.json();
-      setQuotaUsed(prev => prev + (data.quotaUsed || 3));
-      
-      // Update forensic UI
-      if (data.forensicData) {
-        setForensicCrops({
-          header: data.forensicData.header_text || "",
-          footer: data.forensicData.footer_text || "",
-          margin: data.forensicData.margin_text || "",
-        });
-        setRawOcrLog(`${data.forensicData.header_text || ""} ${data.forensicData.footer_text || ""} ${data.forensicData.margin_text || ""}`);
-      }
-      
-      setValidationStatus(data.validationStatus || "pending");
-      
-      // Status message
-      if (data.validationStatus === "verified") {
-        setProcessingLabel("✅ Era validation passed!");
-      } else if (data.validationStatus === "anachronism") {
-        setProcessingLabel("⚠️ Anachronism detected - check forensic details");
-      } else if (data.validationStatus === "mismatch") {
-        setProcessingLabel("⚠️ Mismatch detected - review details");
-      } else if (data.validationStatus === "incomplete") {
-        setProcessingLabel("⚠️ No forensic text detected - check image clarity");
-      }
-      
-      fetchImages();
-      return data;
+      setAskAnswer(res.ok ? data.answer : `Error: ${data.error}`);
     } catch (err: any) {
-      console.error("[PROVENANCE] Stage 2 FAILED:", err);
-      setProcessingLabel(`❌ Validation failed: ${err.message}`);
-    } finally {
-      setProvenanceProcessing(false);
-      setProvenanceStage(null);
+      setAskAnswer(`Error: ${err.message}`);
     }
-  };
+    setAskLoading(false);
+  }
 
-  // Legacy ID (renamed from AI Suggest)
-  const handleLegacyId = async (imageId: number) => {
-    const img = images.find(i => i.id === imageId);
-    if (!img) return;
-    
-    await handleIdentify(imageId, {
-      posterFormat: img.poster_format || undefined,
-      posterCountry: img.poster_country || undefined,
-      yearRangeStart: img.identified_year ? String(img.identified_year - 5) : undefined,
-      yearRangeEnd: img.identified_year ? String(img.identified_year + 5) : undefined,
-    });
-  };
+  // Queue status + batch queueing
+  async function fetchQueueStatus() {
+    try {
+      const res = await client.api.fetch("/api/admin/media-library/queue");
+      const data = await res.json();
+      setQueueStatus(data);
+    } catch (err) {
+      console.warn("Failed to fetch queue status:", err);
+    }
+  }
+
+  async function handleAddToQueue(imageIds: number[]) {
+    try {
+      const res = await client.api.fetch("/api/admin/media-library/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageIds,
+          batchContext: {
+            country: batchContext.country || undefined,
+            format: batchContext.format || undefined,
+            yearStart: batchContext.yearStart ? parseInt(batchContext.yearStart) : undefined,
+            yearEnd: batchContext.yearEnd ? parseInt(batchContext.yearEnd) : undefined,
+          }
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setProcessingLabel(`Added ${imageIds.length} posters to queue (${data.queued} new items)`);
+        fetchQueueStatus();
+      } else {
+        setProcessingLabel(`Failed to queue: ${data.error}`);
+      }
+    } catch (err: any) {
+      setProcessingLabel(`Error: ${err.message}`);
+    }
+  }
 
   // Bulk associate with blog article
   const handleBulkBlog = async () => {
@@ -1808,131 +1852,73 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
   return (
     <div>
       {/* ═══════════════════════════════════════════════════ */}
-      {/* PROVENANCE ENGINE v2.0 - HEADER UI */}
+      {/* CONSOLIDATED IDENTIFY & VERIFY UI (replaces Provenance */}
+      {/* Engine quota dashboard + Glass Box header/footer/margin */}
+      {/* zone display) */}
       {/* ═══════════════════════════════════════════════════ */}
-      
-      {/* Quota Dashboard */}
-      <div className="flex items-center justify-between mb-4 bg-gradient-to-r from-amber-50 to-yellow-50 border border-amber-200 rounded-lg px-4 py-2">
-        <div className="flex items-center gap-2">
-          <span className="text-amber-600 font-semibold">🧬 Provenance Engine</span>
-          <span className="text-xs text-amber-700 bg-amber-100 px-2 py-0.5 rounded">v2.0</span>
+
+      {/* Queue status widget */}
+      {queueStatus && (
+        <div className="flex items-center gap-4 text-xs bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 mb-3">
+          <span><strong>{queueStatus.queue?.pendingCount || 0}</strong> pending in queue</span>
+          <span className="text-gray-400">|</span>
+          <span><strong>{queueStatus.usage?.totalCallsToday || 0}</strong> API calls today</span>
+          <span className="text-gray-400">|</span>
+          <span>Est. cost today: <strong>${queueStatus.usage?.estimatedCostDollarsToday || "0.00"}</strong></span>
         </div>
-        <div className="flex items-center gap-4">
-          <div className="text-sm">
-            <span className="text-gray-600">Daily Quota:</span>{" "}
-            <span className={`font-bold ${quotaUsed > QUOTA_LIMIT * 0.9 ? 'text-red-600' : quotaUsed > QUOTA_LIMIT * 0.7 ? 'text-amber-600' : 'text-green-600'}`}>
-              {quotaUsed}
-            </span>
-            <span className="text-gray-400"> / {QUOTA_LIMIT}</span>
-          </div>
-          
-          {/* Tools Dropdown Menu */}
-          <div className="relative">
-            <button
-              onClick={() => setShowToolsMenu(!showToolsMenu)}
-              className="flex items-center gap-1 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-lg text-sm font-medium text-gray-700 transition-colors"
+      )}
+
+      {/* Batch Context — optional, improves identification accuracy */}
+      <div className="mb-4 p-4 bg-cream-50 border border-cream-200 rounded-lg">
+        <h4 className="text-sm font-semibold mb-2">Batch Context (optional, improves accuracy)</h4>
+        <div className="grid grid-cols-4 gap-3">
+          <div>
+            <label className="text-xs text-gray-600">Country</label>
+            <select
+              className="w-full text-sm border rounded px-2 py-1"
+              value={batchContext.country}
+              onChange={e => setBatchContext(prev => ({ ...prev, country: e.target.value }))}
             >
-              🔧 Tools ▾
-            </button>
-            {showToolsMenu && (
-              <div className="absolute right-0 mt-1 w-48 bg-white border border-gray-200 rounded-lg shadow-lg z-50">
-                <button
-                  onClick={() => {
-                    setShowToolsMenu(false);
-                    // Legacy ID action - will be triggered from selected image
-                    setProcessingLabel("Select an image first, then use Legacy ID from the image actions");
-                  }}
-                  className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                >
-                  📜 Legacy ID
-                </button>
-                <button
-                  onClick={() => {
-                    setShowToolsMenu(false);
-                    setShowGlassBox(!showGlassBox);
-                  }}
-                  className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                >
-                  🔬 Forensic Strip
-                </button>
-                <button
-                  onClick={() => {
-                    setShowToolsMenu(false);
-                    setQuotaUsed(0);
-                  }}
-                  className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                >
-                  🔄 Reset Quota
-                </button>
-              </div>
-            )}
+              <option value="">—</option>
+              <option value="Italy">Italy</option>
+              <option value="France">France</option>
+              <option value="UK">UK</option>
+              <option value="Australia">Australia</option>
+              <option value="Japan">Japan</option>
+              <option value="USA">USA</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-xs text-gray-600">Format</label>
+            <input
+              className="w-full text-sm border rounded px-2 py-1"
+              placeholder="e.g. Italian Locandina"
+              value={batchContext.format}
+              onChange={e => setBatchContext(prev => ({ ...prev, format: e.target.value }))}
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-600">Year range start</label>
+            <input
+              type="number"
+              className="w-full text-sm border rounded px-2 py-1"
+              placeholder="1965"
+              value={batchContext.yearStart}
+              onChange={e => setBatchContext(prev => ({ ...prev, yearStart: e.target.value }))}
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-600">Year range end</label>
+            <input
+              type="number"
+              className="w-full text-sm border rounded px-2 py-1"
+              placeholder="1972"
+              value={batchContext.yearEnd}
+              onChange={e => setBatchContext(prev => ({ ...prev, yearEnd: e.target.value }))}
+            />
           </div>
         </div>
       </div>
-
-      {/* Glass Box Panel - Forensic Strip */}
-      {showGlassBox && (
-        <div className="mb-4 bg-slate-900 rounded-xl p-4 text-white">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="font-semibold flex items-center gap-2">
-              🔬 Forensic Strip
-              <span className={`px-2 py-0.5 rounded text-xs font-bold ${
-                validationStatus === 'verified' ? 'bg-green-500' :
-                validationStatus === 'anachronism' ? 'bg-red-500' :
-                validationStatus === 'mismatch' ? 'bg-orange-500' :
-                validationStatus === 'incomplete' ? 'bg-yellow-500' :
-                'bg-gray-500'
-              }`}>
-                {validationStatus === 'verified' ? '🟢 Verified' :
-                 validationStatus === 'anachronism' ? '🔴 Anachronism' :
-                 validationStatus === 'mismatch' ? '🟠 Mismatch' :
-                 validationStatus === 'incomplete' ? '🟡 Incomplete' :
-                 '⚪ Pending'}
-              </span>
-            </h3>
-            <button onClick={() => setShowGlassBox(false)} className="text-gray-400 hover:text-white">✕</button>
-          </div>
-          
-          {/* Three crop thumbnails */}
-          <div className="grid grid-cols-3 gap-3 mb-3">
-            <div className="bg-slate-800 rounded-lg p-2">
-              <div className="text-xs text-gray-400 mb-1">Header (Top 15%)</div>
-              <div className="h-16 bg-slate-700 rounded flex items-center justify-center text-xs text-gray-500 overflow-hidden">
-                {forensicCrops?.header || "No data"}
-              </div>
-            </div>
-            <div className="bg-slate-800 rounded-lg p-2">
-              <div className="text-xs text-gray-400 mb-1">Footer (Bottom 20%)</div>
-              <div className="h-16 bg-slate-700 rounded flex items-center justify-center text-xs text-gray-500 overflow-hidden">
-                {forensicCrops?.footer || "No data"}
-              </div>
-            </div>
-            <div className="bg-slate-800 rounded-lg p-2">
-              <div className="text-xs text-gray-400 mb-1">Margin (Right 15%)</div>
-              <div className="h-16 bg-slate-700 rounded flex items-center justify-center text-xs text-gray-500 overflow-hidden">
-                {forensicCrops?.margin || "No data"}
-              </div>
-            </div>
-          </div>
-          
-          {/* Raw OCR Log */}
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Raw OCR Log</div>
-            <textarea
-              readOnly
-              value={rawOcrLog}
-              placeholder="OCR text from forensic zones will appear here..."
-              className="w-full h-20 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-xs text-gray-300 resize-none"
-            />
-          </div>
-          
-          {rawOcrLog.length < 10 && rawOcrLog !== "" && (
-            <div className="mt-2 text-yellow-400 text-sm flex items-center gap-2">
-              ⚠️ No Forensic Text Detected. Check Image Clarity.
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Upload zone */}
       <div className="flex gap-3 mb-4">
@@ -2242,22 +2228,12 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
               {downloading ? "Downloading..." : "Download"}
             </button>
             <button onClick={() => {
-              // Bulk OCR - run auto-id on each selected image
-              const runBulkOcr = async () => {
-                const ids = Array.from(selectedIds);
-                for (let i = 0; i < ids.length; i++) {
-                  const img = images.find(im => im.id === ids[i]);
-                  if (img) {
-                    setProcessingId(img.id);
-                    setProcessingLabel(`OCR ${i + 1}/${ids.length}...`);
-                    await handleAutoId(img);
-                  }
-                }
-                setProcessingId(null);
-              };
-              runBulkOcr();
+              // Bulk Identify & Verify — adds selected images to the
+              // processing queue (paced, retried server-side) rather
+              // than firing requests directly from the browser
+              handleAddToQueue(Array.from(selectedIds));
             }} disabled={processingId !== null} className="bg-green-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-green-700 disabled:opacity-50">
-              Run OCR
+              Add to Queue
             </button>
             <button onClick={() => {
               // Bulk TMDB scan - skip OCR, use manual title if available
@@ -2290,30 +2266,8 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
             }} disabled={processingId !== null} className="bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700 disabled:opacity-50">
               TMDB Scan
             </button>
-            <button onClick={() => {
-              // Bulk AI Suggest - verify/identify selected images
-              const runBulkSuggest = async () => {
-                const ids = Array.from(selectedIds);
-                for (let i = 0; i < ids.length; i++) {
-                  const img = images.find(im => im.id === ids[i]);
-                  if (img) {
-                    setProcessingId(img.id);
-                    setProcessingLabel(`AI Suggest ${i + 1}/${ids.length}...`);
-                    try {
-                      const res = await client.api.fetch(`/api/public/library/${img.id}/ai-identify`, { method: "POST" });
-                      if (res.ok) {
-                        const data = await res.json();
-                        setProcessingLabel(data.movie ? `Found: ${data.movie.title}` : "Not identified");
-                      }
-                    } catch (e) { console.error(e); }
-                  }
-                }
-                setProcessingId(null);
-                fetchImages();
-              };
-              runBulkSuggest();
-            }} disabled={processingId !== null} className="bg-purple-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-purple-700 disabled:opacity-50">
-              AI Suggest
+            <button onClick={() => fetchQueueStatus()} className="bg-gray-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-gray-700">
+              Refresh Queue Status
             </button>
             <button onClick={() => {
               // Open a modal for bulk format update
@@ -2376,17 +2330,18 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
                 if (selectedPending.length === 0) return alert("Select matches to approve");
                 
                 const matches = selectedPending.map(img => ({
-                  ebay_listing_id: img.id, // Using image id here
+                  image_id: img.id,
                   inventory_id: img.suggested_inventory_id
                 }));
                 
                 try {
-                  const res = await client.api.fetch("/api/admin/ebay/batch-confirm", {
+                  const res = await client.api.fetch("/api/admin/media-library/batch-confirm-matches", {
                     method: "POST",
+                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ matches })
                   });
                   const data = await res.json();
-                  alert(`${data.total || 0} matches confirmed`);
+                  alert(`${data.confirmed || 0} matches confirmed`);
                   fetchImages();
                   setSelectedIds(new Set());
                 } catch (err) {
@@ -2603,32 +2558,16 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
                       className="text-[10px] bg-teal-50 text-teal-700 border border-teal-300 rounded px-1.5 py-0.5 hover:bg-teal-100 font-medium">
                       🔗 Match
                     </button>
-                    {/* Provenance Engine v2.0 Actions */}
-                    <button 
-                      onClick={() => handleIdentify(img.id, { 
-                        posterFormat: img.poster_format || undefined,
-                        posterCountry: img.poster_country || undefined,
-                        yearRangeStart: img.identified_year ? String(img.identified_year - 5) : undefined,
-                        yearRangeEnd: img.identified_year ? String(img.identified_year + 5) : undefined,
-                      })} 
-                      disabled={provenanceProcessing}
-                      className="text-[10px] bg-purple-50 text-purple-700 border border-purple-300 rounded px-1.5 py-0.5 hover:bg-purple-100 font-medium disabled:opacity-50"
-                      title="Stage 1: Identify (1 unit)"
+                    {/* Identify & Verify (consolidated Stage 1 + Stage 2) */}
+                    <button
+                      onClick={() => handleIdentifyAndVerify(img)}
+                      disabled={identifyLoading.imageId === img.id}
+                      className="text-[10px] bg-noir-700 text-white border border-noir-800 rounded px-1.5 py-0.5 hover:bg-noir-800 font-medium disabled:opacity-50"
+                      title="Identify & Verify (runs Stage 1 + Stage 2)"
                     >
-                      🔍 ID
-                    </button>
-                    <button 
-                      onClick={() => handleValidate(img.id, { 
-                        posterFormat: img.poster_format || undefined,
-                        releaseType: img.release_type || "Original",
-                        yearRangeStart: img.identified_year ? String(img.identified_year - 10) : undefined,
-                        yearRangeEnd: img.identified_year ? String(img.identified_year + 10) : undefined,
-                      })} 
-                      disabled={provenanceProcessing}
-                      className="text-[10px] bg-slate-50 text-slate-700 border border-slate-300 rounded px-1.5 py-0.5 hover:bg-slate-100 font-medium disabled:opacity-50"
-                      title="Stage 2: Validate (3 units)"
-                    >
-                      🔬 Validate
+                      {identifyLoading.imageId === img.id
+                        ? (identifyLoading.stage === 1 ? "Identifying..." : "Forensics...")
+                        : "🔍 Identify & Verify"}
                     </button>
                     <button onClick={() => handleCreateListing(img)} disabled={creatingListingId === img.id}
                       className="text-[10px] bg-blue-50 text-blue-700 border border-blue-300 rounded px-1.5 py-0.5 hover:bg-blue-100 font-medium disabled:opacity-50">
@@ -2639,8 +2578,85 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
                       ✕
                     </button>
                   </div>
+
+                  {/* Identify & Verify results panel */}
+                  {identifyResult && identifyResult.img.id === img.id && (
+                    <div className="mt-2 border border-gray-200 rounded-lg p-3 bg-white text-[11px]">
+                      {identifyResult.stage1 && (
+                        <div className="mb-2">
+                          <div className="text-[10px] font-semibold text-gray-500 mb-1">IDENTIFICATION</div>
+                          <FieldRow label="Title" value={identifyResult.stage1.movie_title} onEdit={() => { setEditingField("title"); setEditValue(identifyResult.stage1.movie_title || ""); }} />
+                          <FieldRow label="Year" value={identifyResult.stage1.release_year} onEdit={() => { setEditingField("year"); setEditValue(identifyResult.stage1.release_year || ""); }} />
+                          <FieldRow label="Director" value={identifyResult.stage1.director_canonical || identifyResult.stage1.director_billing} onEdit={() => { setEditingField("director"); setEditValue(identifyResult.stage1.director_canonical || ""); }} />
+                          <FieldRow label="Cast" value={(identifyResult.stage1.lead_cast || []).join(", ")} onEdit={() => { setEditingField("actors"); setEditValue((identifyResult.stage1.lead_cast || []).join(", ")); }} />
+                          <FieldRow label="Confidence" value={`${Math.round((identifyResult.stage1.confidence || 0) * 100)}%`} />
+                          {editingField && (
+                            <div className="mt-1 flex gap-1 items-center bg-blue-50 p-1.5 rounded">
+                              <input
+                                className="flex-1 text-[11px] border rounded px-1.5 py-0.5"
+                                value={editValue}
+                                onChange={e => setEditValue(e.target.value)}
+                                placeholder={`Correct ${editingField}...`}
+                              />
+                              <button className="text-[10px] bg-blue-600 text-white px-2 py-0.5 rounded"
+                                onClick={() => handleRetryWithCorrection(img, editingField, editValue)}>
+                                Re-run
+                              </button>
+                              <button className="text-[10px] text-gray-500" onClick={() => setEditingField(null)}>Cancel</button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {identifyResult.stage2 && !identifyResult.stage2.error && (
+                        <div className="mb-2">
+                          <div className="text-[10px] font-semibold text-gray-500 mb-1">FORENSIC SCAN</div>
+                          <FieldRow label="Printer" value={identifyResult.stage2.printer_credit} />
+                          <FieldRow label="Distributor" value={identifyResult.stage2.studio_distributor} />
+                          <FieldRow label="Censorship #" value={identifyResult.stage2.censorship_number} />
+                          <FieldRow label="Edition" value={identifyResult.stage2.edition_marking} />
+                          <div className="mt-1">
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                              identifyResult.stage2.validation_status?.includes("original") ? "bg-green-100 text-green-800" :
+                              identifyResult.stage2.validation_status?.includes("reissue") ? "bg-orange-100 text-orange-800" :
+                              identifyResult.stage2.validation_status === "anachronism" ? "bg-red-100 text-red-800" :
+                              "bg-gray-100 text-gray-700"
+                            }`}>
+                              {(identifyResult.stage2.validation_status || "").replace(/_/g, " ").toUpperCase()}
+                            </span>
+                          </div>
+                          {identifyResult.stage2.conflict_flags?.length > 0 && (
+                            <div className="mt-1 text-[10px] bg-red-50 text-red-800 p-1.5 rounded">
+                              {identifyResult.stage2.conflict_flags.map((f: string, i: number) => <div key={i}>⚠ {f}</div>)}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {identifyResult.stage2?.error && (
+                        <div className="text-[10px] bg-red-50 text-red-700 p-1.5 rounded">
+                          Forensic scan failed: {identifyResult.stage2.error}
+                        </div>
+                      )}
+                      {/* Ask a specific question */}
+                      <div className="border-t pt-1.5 mt-1.5">
+                        <div className="flex gap-1">
+                          <input
+                            className="flex-1 text-[11px] border rounded px-1.5 py-0.5"
+                            placeholder="Ask: is this a reissue? who's the distributor?"
+                            value={askQuestion}
+                            onChange={e => setAskQuestion(e.target.value)}
+                            onKeyDown={e => { if (e.key === "Enter") handleAskQuestion(img); }}
+                          />
+                          <button className="text-[10px] bg-noir-700 text-white px-2 py-0.5 rounded"
+                            disabled={askLoading} onClick={() => handleAskQuestion(img)}>
+                            {askLoading ? "..." : "Ask"}
+                          </button>
+                        </div>
+                        {askAnswer && <div className="mt-1 text-[11px] bg-gray-50 p-1.5 rounded">{askAnswer}</div>}
+                      </div>
+                    </div>
+                  )}
                   <button onClick={() => { setSplitModalImage(img); setSplitCount(2); }}
-                    className="text-[10px] bg-purple-50 text-purple-700 border border-purple-300 rounded px-1.5 py-0.5 hover:bg-purple-100 font-medium">
+                    className="text-[10px] bg-purple-50 text-purple-700 border border-purple-300 rounded px-1.5 py-0.5 hover:bg-purple-100 font-medium mt-1.5">
                     ✂️ Split
                   </button>
                 </div>
@@ -2695,13 +2711,15 @@ export default function MediaLibrary({ onRefreshInventory }: { onRefreshInventor
                       className="text-[10px] bg-gray-50 text-gray-600 border border-gray-200 rounded px-1.5 py-0.5 hover:bg-gray-100">
                       ✏️
                     </button>
-                    <button onClick={() => handleAutoId(img)} disabled={processingId !== null}
-                      className="text-[10px] bg-green-50 text-green-700 border border-green-200 rounded px-1.5 py-0.5 hover:bg-green-100 disabled:opacity-40">
-                      🔍 ID
-                    </button>
-                    <button onClick={() => handleAiIdentify(img)} disabled={processingId !== null}
-                      className="text-[10px] bg-purple-50 text-purple-700 border border-purple-200 rounded px-1.5 py-0.5 hover:bg-purple-100 disabled:opacity-40">
-                      🤖 AI
+                    <button
+                      onClick={() => handleIdentifyAndVerify(img)}
+                      disabled={identifyLoading.imageId === img.id}
+                      className="text-[10px] bg-noir-700 text-white border border-noir-800 rounded px-1.5 py-0.5 hover:bg-noir-800 disabled:opacity-50"
+                      title="Identify & Verify (runs Stage 1 + Stage 2)"
+                    >
+                      {identifyLoading.imageId === img.id
+                        ? (identifyLoading.stage === 1 ? "Identifying..." : "Forensics...")
+                        : "🔍 Identify & Verify"}
                     </button>
                     <button onClick={() => openMatchModal(img)}
                       className="text-[10px] bg-blue-50 text-blue-700 border border-blue-200 rounded px-1.5 py-0.5 hover:bg-blue-100">
