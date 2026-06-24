@@ -174,6 +174,7 @@ const STAGE1_MODEL = "gemini-2.5-flash-lite";
 const STAGE2_MODEL = "gemini-2.5-flash";
 const STAGE1_COST_CENTS = 0.1;
 const STAGE2_COST_CENTS = 0.2;
+const STAGE2_PRO_COST_CENTS = 1.5; // gemini-2.5-pro costs more per call than flash; still free-tier eligible at low volume
 
 const KNOWN_ITALIAN_PRINTERS = [
   "Rotolitografica", "Rotopress", "Arti Grafiche Zoli", "Litoroma",
@@ -320,98 +321,22 @@ export async function createApp(
     }
   });
 
-  // Ensure eBay listings table exists
-  try {
-    await edgespark.db.all(sql.raw(`
-      CREATE TABLE IF NOT EXISTS ebay_listings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ebay_item_id TEXT UNIQUE NOT NULL,
-        title TEXT,
-        price REAL,
-        currency TEXT DEFAULT 'USD',
-        condition TEXT,
-        item_web_url TEXT,
-        image_url TEXT,
-        shipping_cost REAL,
-        status TEXT DEFAULT 'active',
-        listing_type TEXT,
-        seller TEXT,
-        last_synced_at INTEGER,
-        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
-      )
-    `));
-    console.log("[DB] ebay_listings table ready");
-  } catch (e) {
-    console.warn("[DB] ebay_listings table creation skipped:", e);
-  }
+  // NOTE: ebay_listings table creation was REMOVED from here — it was
+  // running as `await edgespark.db...` directly in createApp()'s body,
+  // outside any route handler. This is exactly what caused the
+  // "unsettled top-level await" deploy crash: EdgeSpark's CLI calls
+  // createApp(mock) during route analysis, and this await never
+  // resolved against the mock object. Run the table creation once,
+  // manually, via `edgespark db sql` instead — see one_time_db_setup.sql.
 
-  // ═══════════════════════════════════════════════════
-  // CONSOLIDATION ADDITIONS — processing queue + usage tracking
-  // ═══════════════════════════════════════════════════
-  try {
-    await edgespark.db.all(sql.raw(`
-      CREATE TABLE IF NOT EXISTS processing_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        image_id INTEGER NOT NULL,
-        stage TEXT NOT NULL DEFAULT 'stage1',
-        status TEXT NOT NULL DEFAULT 'pending',
-        priority INTEGER DEFAULT 0,
-        batch_context TEXT,
-        error TEXT,
-        queued_at INTEGER NOT NULL,
-        started_at INTEGER,
-        completed_at INTEGER,
-        created_at INTEGER NOT NULL DEFAULT (cast(unixepoch('subsecond') * 1000 as integer))
-      )
-    `));
-    await edgespark.db.all(sql.raw(`
-      CREATE INDEX IF NOT EXISTS queue_status_idx ON processing_queue(status, stage)
-    `));
-    await edgespark.db.all(sql.raw(`
-      CREATE INDEX IF NOT EXISTS queue_image_idx ON processing_queue(image_id)
-    `));
-    await edgespark.db.all(sql.raw(`
-      CREATE TABLE IF NOT EXISTS api_usage_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        model TEXT NOT NULL,
-        stage TEXT NOT NULL,
-        calls INTEGER DEFAULT 0,
-        estimated_cost_cents REAL DEFAULT 0,
-        last_call_at INTEGER,
-        UNIQUE(date, model, stage)
-      )
-    `));
-    console.log("[DB] processing_queue and api_usage_log tables ready");
-  } catch (e) {
-    console.warn("[DB] queue/usage table creation skipped:", e);
-  }
+  // NOTE: processing_queue and api_usage_log table creation was REMOVED
+  // from here for the same reason as above — see one_time_db_setup.sql.
 
   // ═══════════════════════════════════════════════════
   // PROVENANCE ENGINE v2.0 - ARCHIVAL DNA FIELDS
   // ═══════════════════════════════════════════════════
-  // Add Archival DNA columns to image_library table
-  const dnaColumns = [
-    "title_english TEXT",
-    "title_local TEXT",
-    "original_release_year INTEGER",
-    "printer_credit TEXT",
-    "nss_visa_code TEXT",
-    "distributor_logo TEXT",
-    "dna_audit_status TEXT DEFAULT 'pending'",
-    "dna_ocr_raw TEXT",
-    "dna_forensic_crops TEXT",
-  ];
-  
-  for (const col of dnaColumns) {
-    try {
-      const colName = col.split(" ")[0];
-      await edgespark.db.all(sql.raw(`ALTER TABLE image_library ADD COLUMN IF NOT EXISTS ${colName}`));
-    } catch (e) {
-      // Column may already exist, continue
-    }
-  }
-  console.log("[DB] Archival DNA columns ready");
+  // NOTE: the image_library "Archival DNA" column additions were REMOVED
+  // from here — same reason as above, see one_time_db_setup.sql.
 
   // Helper to validate ID parameter
   const parseIdParam = (idStr: string): number => {
@@ -581,49 +506,11 @@ export async function createApp(
   });
 
   // Confirm upload completed
-  // ═══════════════════════════════════════════════════════════
-  // BATCH INGEST METADATA COLUMNS
-  // Add columns to poster_uploads table if they don't exist
-  // ═══════════════════════════════════════════════════════════
-  const uploadBatchColumns = [
-    "lot_number TEXT",
-    "expected_era_start INTEGER",
-    "expected_era_end INTEGER",
-    "poster_country TEXT",
-    "poster_format TEXT",
-    "batch_notes TEXT",
-  ];
-  
-  for (const col of uploadBatchColumns) {
-    try {
-      const colName = col.split(" ")[0];
-      await edgespark.db.all(sql.raw(`ALTER TABLE poster_uploads ADD COLUMN IF NOT EXISTS ${colName}`));
-    } catch (e) {
-      // Column may already exist, continue
-    }
-  }
-  console.log("[DB] Batch Ingest columns ready");
+  // NOTE: poster_uploads batch ingest column additions were REMOVED from
+  // here — same reason as above, see one_time_db_setup.sql.
 
-  // Add columns to posters table for CRM tracking
-  const posterBatchColumns = [
-    "lot_number TEXT",
-    "expected_period_start INTEGER",
-    "expected_period_end INTEGER",
-    "poster_country TEXT",
-    "poster_format TEXT",
-    "conflict_status TEXT DEFAULT 'none'",
-    "conflict_details TEXT",
-  ];
-  
-  for (const col of posterBatchColumns) {
-    try {
-      const colName = col.split(" ")[0];
-      await edgespark.db.all(sql.raw(`ALTER TABLE posters ADD COLUMN IF NOT EXISTS ${colName}`));
-    } catch (e) {
-      // Column may already exist, continue
-    }
-  }
-  console.log("[DB] Poster CRM columns ready");
+  // NOTE: posters CRM column additions were REMOVED from here — same
+  // reason as above, see one_time_db_setup.sql.
 
   // ═══════════════════════════════════════════════════════════
   // BATCH UPLOAD CONFIRM - Stores Metadata
@@ -3223,26 +3110,45 @@ app.get("/api/admin/media-library/suggest-match", async (c) => {
     titles: string[],
     year?: number,
     lotNumber?: string | null,
-    limit = 5
+    limit = 5,
+    director?: string,
+    actors?: string
   ) => {
     const clean = (s: string) => s.toLowerCase()
       .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
       .replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
 
     const cleanTitles = [...new Set(titles.map(clean).filter(t => t.length >= 2))];
-    if (cleanTitles.length === 0) return [];
+    const cleanDirector = director ? clean(director) : "";
+    const cleanActors = actors ? actors.split(",").map(a => clean(a.trim())).filter(a => a.length >= 2) : [];
 
-    const titleConditions = cleanTitles.map(t =>
+    // If we have no title to go on at all but DO have director+actor+year,
+    // still attempt a match using those alone — this is the multi-key
+    // matrix approach for cases where title text is unreliable (e.g.
+    // spaghetti westerns where Italian/US titles share no words at all)
+    if (cleanTitles.length === 0 && !cleanDirector && cleanActors.length === 0) return [];
+
+    const titleConditions = cleanTitles.length > 0 ? cleanTitles.map(t =>
       `LOWER(REPLACE(REPLACE(REPLACE(title, '-', ''), ':', ''), '''', '')) LIKE '%${t.replace(/'/g, "''")}%'
        OR LOWER(COALESCE(original_title, '')) LIKE '%${t.replace(/'/g, "''")}%'`
-    ).join(" OR ");
+    ).join(" OR ") : "";
+
+    // Director/actor conditions act as an OR fallback — a poster with a
+    // confidently-identified director+actor+year can surface inventory
+    // candidates even when the title text comparison alone would miss them
+    const personConditions: string[] = [];
+    if (cleanDirector) personConditions.push(`LOWER(COALESCE(director, '')) LIKE '%${cleanDirector.replace(/'/g, "''")}%'`);
+    for (const a of cleanActors) personConditions.push(`LOWER(COALESCE(actors, '')) LIKE '%${a.replace(/'/g, "''")}%'`);
+
+    const allConditions = [titleConditions, ...personConditions].filter(Boolean).join(" OR ");
+    if (!allConditions) return [];
 
     let query = `SELECT id, title, original_title, year, format, actors, director, genre, lot_id
-      FROM inventory WHERE (${titleConditions})`;
+      FROM inventory WHERE (${allConditions})`;
 
     if (lotNumber) query += ` AND lot_id = '${lotNumber.replace(/'/g, "''")}'`;
     if (year) query += ` AND (year = ${year} OR year IS NULL)`;
-    query += ` LIMIT ${limit * 2}`;
+    query += ` LIMIT ${limit * 3}`;
 
     const results = await edgespark.db.all<any>(sql.raw(query));
 
@@ -3252,16 +3158,37 @@ app.get("/api/admin/media-library/suggest-match", async (c) => {
       .map((r: any) => {
         const rt = clean(r.title);
         const rot = clean(r.original_title || "");
-        let bestScore = 0;
+        let bestTitleScore = 0;
         for (const ct of cleanTitles) {
           let score = 0;
           if (rt === ct || rot === ct) score = 100;
           else if (rt.includes(ct) || ct.includes(rt)) score = 80;
           else if (rot && (rot.includes(ct) || ct.includes(rot))) score = 85;
-          if (year && r.year === year) score += 10;
-          bestScore = Math.max(bestScore, score);
+          bestTitleScore = Math.max(bestTitleScore, score);
         }
-        return { ...r, score: bestScore };
+
+        // Director/actor matching — the multi-key matrix. Director+actor+year
+        // agreement is a strong signal even when title text matching is weak,
+        // which is exactly the spaghetti-western case (recycled character
+        // names, unrelated US/Italian titles for the same production).
+        let personScore = 0;
+        const rDirector = clean(r.director || "");
+        const rActors = clean(r.actors || "");
+        if (cleanDirector && rDirector && (rDirector.includes(cleanDirector) || cleanDirector.includes(rDirector))) {
+          personScore += 35;
+        }
+        for (const a of cleanActors) {
+          if (rActors.includes(a)) personScore += 20;
+        }
+        personScore = Math.min(personScore, 70); // cap so person-match alone can't exceed a real title match
+
+        let bestScore = Math.max(bestTitleScore, personScore);
+        // If BOTH title and person signals agree, that's the strongest
+        // possible match — boost rather than just taking the max
+        if (bestTitleScore >= 60 && personScore >= 35) bestScore = Math.min(100, bestTitleScore + 15);
+
+        if (year && r.year === year) bestScore += 10;
+        return { ...r, score: bestScore, matchedVia: personScore > bestTitleScore ? "director/actor" : "title" };
       })
       .filter((r: any) => r.score > 0)
       .sort((a: any, b: any) => b.score - a.score)
@@ -6111,7 +6038,10 @@ Return ONLY valid JSON matching this exact schema. Empty string for unknown fiel
               alternativeTitles: altTitles.titles?.map((t: any) => t.title) || []
             };
 
-            // Search inventory using ALL known title variants simultaneously
+            // Search inventory using ALL known title variants simultaneously,
+            // plus director/actors as a fallback signal (the multi-key matrix
+            // — director+actor+year often succeeds where title text alone
+            // fails, e.g. spaghetti westerns with unrelated US/Italian titles)
             const allTitles = [
               movieData.movie_title,
               movieData.title_local,
@@ -6124,12 +6054,36 @@ Return ONLY valid JSON matching this exact schema. Empty string for unknown fiel
             inventoryMatches = await fuzzyMatchInventoryMulti(
               allTitles,
               parseInt(movieData.release_year || tmdbData.year || "0"),
-              img.lot_number
+              img.lot_number,
+              5,
+              movieData.director_canonical || movieData.director_billing,
+              movieData.lead_cast?.join(", ")
             );
           }
         } catch (err: any) {
           console.warn("[Stage1] TMDB lookup failed:", err.message);
         }
+      }
+    }
+
+    // Fallback: if TMDB found nothing (or wasn't reachable) but Stage 1 still
+    // identified a director/actors/year with reasonable confidence, still
+    // attempt an inventory match using those signals alone. This is the case
+    // that was previously falling through entirely — a poster TMDB couldn't
+    // resolve (common for obscure spaghetti westerns) used to get zero
+    // inventory match attempts no matter how confident the identification was.
+    if (inventoryMatches.length === 0 && (movieData.director_canonical || movieData.director_billing || movieData.lead_cast?.length)) {
+      try {
+        inventoryMatches = await fuzzyMatchInventoryMulti(
+          [movieData.movie_title, movieData.title_local, movieData.title_billing].filter(Boolean),
+          parseInt(movieData.release_year || "0"),
+          img.lot_number,
+          5,
+          movieData.director_canonical || movieData.director_billing,
+          movieData.lead_cast?.join(", ")
+        );
+      } catch (err: any) {
+        console.warn("[Stage1] Fallback director/actor match failed:", err.message);
       }
     }
 
@@ -6206,9 +6160,16 @@ app.post("/api/library/:id/forensic", async (c) => {
     format?: string;
     yearStart?: number;
     yearEnd?: number;
+    model?: string; // optional override: "gemini-2.5-flash" (default, cheap) or "gemini-2.5-pro" (stronger, costs more)
   };
 
-  console.log("[Stage2] POST /api/library/:id/forensic", { id, body });
+  // Validate model override — only allow the two known tiers, never pass through arbitrary input
+  const ALLOWED_STAGE2_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"];
+  const selectedModel = (body.model && ALLOWED_STAGE2_MODELS.includes(body.model)) ? body.model : STAGE2_MODEL;
+  const isPro = selectedModel === "gemini-2.5-pro";
+  const selectedCostCents = isPro ? STAGE2_PRO_COST_CENTS : STAGE2_COST_CENTS;
+
+  console.log("[Stage2] POST /api/library/:id/forensic", { id, body, selectedModel });
 
   const geminiKey = edgespark.secret.get("GEMINI_API_KEY");
   if (!geminiKey) return c.json({ error: "GEMINI_API_KEY not configured" }, 500);
@@ -6314,7 +6275,7 @@ CRITICAL RULES:
 
   try {
     const result = await geminiWithRetry(ai, {
-      model: STAGE2_MODEL,
+      model: selectedModel,
       generationConfig: {
         responseMimeType: "application/json",
         responseSchema,
@@ -6415,7 +6376,7 @@ CRITICAL RULES:
       WHERE id = ${id}
     `));
 
-    await trackUsage(edgespark, sql, STAGE2_MODEL, "stage2", STAGE2_COST_CENTS);
+    await trackUsage(edgespark, sql, selectedModel, "stage2", selectedCostCents);
 
     await edgespark.db.all(sql.raw(`
       UPDATE processing_queue SET status = 'done', completed_at = ${Date.now()}
@@ -6424,7 +6385,7 @@ CRITICAL RULES:
 
     return c.json({
       success: true,
-      forensic: { ...forensicData, conflict_flags: anachronisms, validation_status: validationStatus }
+      forensic: { ...forensicData, conflict_flags: anachronisms, validation_status: validationStatus, model_used: selectedModel }
     });
 
   } catch (err: any) {
@@ -6745,49 +6706,9 @@ app.post("/api/ebay/batch-link", async (c) => {
   // EBAY COMMAND BRIDGE - FRAME AND REEL
   // ═══════════════════════════════════════════════════════════
 
-  // Enhanced eBay listings table with Frame & Reel fields
-  try {
-    await edgespark.db.all(sql.raw(`
-      CREATE TABLE IF NOT EXISTS ebay_listings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ebay_item_id TEXT UNIQUE,
-        title TEXT,
-        price REAL,
-        currency TEXT DEFAULT 'USD',
-        condition TEXT,
-        item_web_url TEXT,
-        image_url TEXT,
-        shipping_cost REAL,
-        status TEXT DEFAULT 'draft',
-        listing_type TEXT,
-        seller TEXT,
-        last_synced_at INTEGER,
-        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
-        -- Frame & Reel specific fields
-        poster_id INTEGER,
-        ebay_listing_id TEXT,
-        description_html TEXT,
-        year INTEGER,
-        director TEXT,
-        cast TEXT,
-        format TEXT,
-        origin TEXT,
-        decade TEXT,
-        other_notes TEXT,
-        gemini_synopsis TEXT,
-        gemini_collector_note TEXT,
-        condition_details TEXT,
-        category_id TEXT,
-        -- Business policies
-        shipping_policy_id TEXT,
-        payment_policy_id TEXT,
-        return_policy_id TEXT
-      )
-    `));
-    console.log("[DB] Enhanced ebay_listings table ready");
-  } catch (e) {
-    console.warn("[DB] ebay_listings table creation skipped:", e);
-  }
+  // NOTE: the second (Frame & Reel enhanced) ebay_listings table
+  // creation was REMOVED from here — same reason as above, this is
+  // already covered in one_time_db_setup.sql.
 
   // Get all eBay listings (with filters)
   app.get("/api/ebay/listings", async (c) => {
